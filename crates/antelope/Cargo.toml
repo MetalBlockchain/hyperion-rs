@@ -1,0 +1,15 @@
+[package]
+name = "antelope"
+description = "Core Antelope (EOSIO) chain types and ABI-driven binary decoding"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+hex.workspace = true
+chrono.workspace = true
+bs58 = "0.5"
+ripemd = "0.1"

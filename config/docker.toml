@@ -1,0 +1,36 @@
+# Configuration used by docker-compose. Service names resolve inside the
+# compose network.
+
+[chain]
+name = "pulse"
+# PulseVM JSON-RPC, served by the metalgo node at /ext/bc/<chainID>/rpc
+# (9650 is the node's public HTTP API port).
+http = "http://localhost:9650/ext/bc/dbmApAUgd9jbQRmcWLXkg1jxoGbdVsY7gtZGLk59JcoXvbF8S/rpc"
+ship = "ws://localhost:9090"
+# Chain API dialect: "antelope" (nodeos REST) or "pulsevm" (JSON-RPC).
+api = "pulsevm"
+# Privileged system account (eosio on Antelope chains, pulse on PulseVM).
+system_account = "pulse"
+
+[indexer]
+start_block = 0
+stop_block = 0
+fetch_block = true
+fetch_traces = true
+fetch_deltas = true
+max_messages_in_flight = 128
+batch_size = 2000
+flush_interval_ms = 500
+skip_actions = []
+
+[elasticsearch]
+url = "http://elasticsearch:9200"
+user = ""
+pass = ""
+shards = 1
+replicas = 0
+
+[api]
+# Must bind 0.0.0.0 inside the container so the published port works.
+listen = "0.0.0.0:7000"
+max_limit = 1000

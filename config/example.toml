@@ -1,0 +1,46 @@
+# Hyperion-rs configuration. Copy to config.toml and adjust.
+
+[chain]
+# Short chain name, used as the Elasticsearch index prefix.
+name = "eos"
+# Chain API endpoint (used for get_info, get_abi fallback).
+# - antelope: nodeos REST base URL, e.g. "http://127.0.0.1:8888"
+# - pulsevm:  JSON-RPC URL, e.g. "http://node:9650/ext/bc/<chainID>/rpc"
+http = "http://127.0.0.1:8888"
+# State-history plugin websocket endpoint.
+ship = "ws://127.0.0.1:8080"
+# Chain API dialect: "antelope" (default) or "pulsevm".
+api = "antelope"
+# Privileged system account: "eosio" on Antelope chains (default),
+# "pulse" on PulseVM. Its setabi action updates the ABI cache inline.
+system_account = "eosio"
+
+[indexer]
+# First block to index. 0 = resume from the last indexed block (or genesis).
+start_block = 0
+# Last block to index. 0 = follow the chain head indefinitely.
+stop_block = 0
+fetch_block = true
+fetch_traces = true
+fetch_deltas = true
+# SHIP flow-control credit (blocks in flight before ack).
+max_messages_in_flight = 128
+# Documents per Elasticsearch bulk request.
+batch_size = 2000
+# Max time (ms) a partial batch waits before being flushed.
+flush_interval_ms = 500
+# Actions to skip entirely, as "contract::action".
+skip_actions = []
+# skip_actions = ["eosio::onblock"]
+
+[elasticsearch]
+url = "http://127.0.0.1:9200"
+user = ""
+pass = ""
+shards = 1
+replicas = 0
+
+[api]
+listen = "127.0.0.1:7000"
+# Hard cap on `limit` request parameters.
+max_limit = 1000

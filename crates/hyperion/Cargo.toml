@@ -1,0 +1,30 @@
+[package]
+name = "hyperion"
+description = "Hyperion history indexer and API for Antelope chains"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+antelope = { path = "../antelope" }
+ship = { path = "../ship" }
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+hex.workspace = true
+chrono.workspace = true
+tokio.workspace = true
+futures-util.workspace = true
+reqwest.workspace = true
+axum.workspace = true
+clap.workspace = true
+toml.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tokio-tungstenite.workspace = true
+
+[[bin]]
+name = "hyperion"
+path = "src/main.rs"

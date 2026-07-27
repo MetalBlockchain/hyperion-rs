@@ -1,0 +1,18 @@
+[package]
+name = "ship"
+description = "Antelope state-history plugin (SHIP) websocket client and protocol codecs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+antelope = { path = "../antelope" }
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+hex.workspace = true
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+futures-util.workspace = true
+tracing.workspace = true
