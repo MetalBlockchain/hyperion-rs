@@ -18,6 +18,15 @@ pub struct GetActionsParams {
     pub after: Option<String>,
     pub before: Option<String>,
     pub simple: Option<bool>,
+    /// Filters on the indexed `@transfer` extract (Hyperion-compatible).
+    #[serde(rename = "transfer.from")]
+    pub transfer_from: Option<String>,
+    #[serde(rename = "transfer.to")]
+    pub transfer_to: Option<String>,
+    #[serde(rename = "transfer.symbol")]
+    pub transfer_symbol: Option<String>,
+    #[serde(rename = "transfer.memo")]
+    pub transfer_memo: Option<String>,
 }
 
 fn filter_clause(filter: &str) -> Result<Value, ApiError> {
@@ -48,6 +57,18 @@ pub async fn get_actions(
     }
     if let Some(filter) = &params.filter {
         filters.push(filter_clause(filter)?);
+    }
+    for (field, value) in [
+        ("@transfer.from", &params.transfer_from),
+        ("@transfer.to", &params.transfer_to),
+        ("@transfer.symbol", &params.transfer_symbol),
+    ] {
+        if let Some(value) = value {
+            filters.push(json!({"term": {field: value}}));
+        }
+    }
+    if let Some(memo) = &params.transfer_memo {
+        filters.push(json!({"match": {"@transfer.memo": memo}}));
     }
     filters.extend(range_filters(
         params.after.as_deref(),
@@ -241,7 +262,7 @@ pub async fn get_created_accounts(
         "size": 100,
         "query": {"bool": {"filter": [
             {"term": {"act.name": "newaccount"}},
-            {"term": {"act.data.creator.keyword": params.account}},
+            {"term": {"@newaccount.creator": params.account}},
         ]}},
         "sort": [{"global_sequence": {"order": "desc"}}],
     });
@@ -269,12 +290,10 @@ pub async fn get_creator(
     let body = json!({
         "size": 1,
         "query": {"bool": {
-            "filter": [{"term": {"act.name": "newaccount"}}],
-            "should": [
-                {"term": {"act.data.newact.keyword": params.account}},
-                {"term": {"act.data.name.keyword": params.account}},
+            "filter": [
+                {"term": {"act.name": "newaccount"}},
+                {"term": {"@newaccount.newact": params.account}},
             ],
-            "minimum_should_match": 1,
         }},
         "sort": [{"global_sequence": {"order": "asc"}}],
     });

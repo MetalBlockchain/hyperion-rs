@@ -273,6 +273,13 @@ impl Processor {
             if primary.creator_action_ordinal == 0 && !signatures.is_empty() {
                 body["signatures"] = json!(signatures);
             }
+            // act.data is not indexed (its field types conflict across
+            // actions), so extract known actions into typed root fields.
+            if let Some(extracted) = extract_action_fields(&primary.act.name, &body["act"]["data"])
+            {
+                let (field, value) = extracted;
+                body[field] = value;
+            }
             docs.push(Doc::index(
                 "action",
                 receipt.global_sequence.to_string(),
@@ -448,6 +455,35 @@ impl Processor {
     }
 }
 
+/// Hyperion-style typed extracts of well-known actions, indexed at the doc
+/// root (`@transfer`, `@newaccount`) since `act.data` itself is unindexed.
+fn extract_action_fields(action: &Name, data: &Value) -> Option<(&'static str, Value)> {
+    match action.to_string().as_str() {
+        "transfer" => {
+            let from = data["from"].as_str()?;
+            let to = data["to"].as_str()?;
+            let mut fields = json!({"from": from, "to": to});
+            if let Some(asset) = data["quantity"].as_str().and_then(parse_asset) {
+                fields["amount"] = json!(asset.to_f64());
+                fields["symbol"] = json!(asset.symbol.code().to_string());
+            }
+            if let Some(memo) = data["memo"].as_str() {
+                fields["memo"] = json!(memo);
+            }
+            Some(("@transfer", fields))
+        }
+        "newaccount" => {
+            let newact = data["newact"].as_str().or_else(|| data["name"].as_str())?;
+            let mut fields = json!({"newact": newact});
+            if let Some(creator) = data["creator"].as_str() {
+                fields["creator"] = json!(creator);
+            }
+            Some(("@newaccount", fields))
+        }
+        _ => None,
+    }
+}
+
 async fn decode_action_data(
     trace: &ActionTrace,
     abis: &mut AbiCache,
@@ -507,5 +543,31 @@ mod tests {
 
         assert!(parse_asset("garbage").is_none());
         assert!(parse_asset("1.0 lowercase").is_none());
+    }
+
+    #[test]
+    fn extracts_known_actions() {
+        let name = |s| Name::from_str(s).unwrap();
+
+        let data = json!({"from": "alice", "to": "bob", "quantity": "1.5000 EOS", "memo": "hi"});
+        let (field, value) = extract_action_fields(&name("transfer"), &data).unwrap();
+        assert_eq!(field, "@transfer");
+        assert_eq!(
+            value,
+            json!({"from": "alice", "to": "bob", "amount": 1.5, "symbol": "EOS", "memo": "hi"})
+        );
+
+        // newaccount with either field name for the created account.
+        let data = json!({"creator": "alice", "newact": "bob"});
+        let (field, value) = extract_action_fields(&name("newaccount"), &data).unwrap();
+        assert_eq!(field, "@newaccount");
+        assert_eq!(value, json!({"newact": "bob", "creator": "alice"}));
+        let data = json!({"creator": "alice", "name": "bob"});
+        let (_, value) = extract_action_fields(&name("newaccount"), &data).unwrap();
+        assert_eq!(value["newact"], "bob");
+
+        // Undecoded data (act.data missing) and unknown actions extract nothing.
+        assert!(extract_action_fields(&name("transfer"), &Value::Null).is_none());
+        assert!(extract_action_fields(&name("setcode"), &json!({"owner": "x"})).is_none());
     }
 }

@@ -160,7 +160,18 @@ pub fn index_definitions(shards: u32, replicas: u32) -> Vec<(&'static str, Value
                     "act.name": {"type": "keyword"},
                     "act.authorization.actor": {"type": "keyword"},
                     "act.authorization.permission": {"type": "keyword"},
-                    "act.data": {"type": "object", "enabled": true, "dynamic": true},
+                    // act.data field types vary per action (e.g. `owner` is a
+                    // name in buyram but an authority object in newaccount), so
+                    // it must not be indexed; it stays in _source. Searchable
+                    // extracts of known actions live in @transfer/@newaccount.
+                    "act.data": {"type": "object", "enabled": false},
+                    "@transfer.from": {"type": "keyword"},
+                    "@transfer.to": {"type": "keyword"},
+                    "@transfer.amount": {"type": "double"},
+                    "@transfer.symbol": {"type": "keyword"},
+                    "@transfer.memo": {"type": "text"},
+                    "@newaccount.newact": {"type": "keyword"},
+                    "@newaccount.creator": {"type": "keyword"},
                     "act.hex_data": {"type": "keyword", "index": false, "doc_values": false},
                     "notified": {"type": "keyword"},
                     "receipts.receiver": {"type": "keyword"},
@@ -204,7 +215,8 @@ pub fn index_definitions(shards: u32, replicas: u32) -> Vec<(&'static str, Value
                     "primary_key": {"type": "keyword"},
                     "payer": {"type": "keyword"},
                     "present": {"type": "boolean"},
-                    "data": {"type": "object", "enabled": true, "dynamic": true},
+                    // Same per-contract type-conflict hazard as act.data.
+                    "data": {"type": "object", "enabled": false},
                     "value_hex": {"type": "keyword", "index": false, "doc_values": false},
                 }}
             }),
