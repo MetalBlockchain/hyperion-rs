@@ -12,7 +12,7 @@ use crate::types::{
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
+use tokio_tungstenite::{connect_async_with_config, MaybeTlsStream, WebSocketStream};
 
 #[derive(Debug, Clone)]
 pub struct ShipConfig {
@@ -39,7 +39,13 @@ pub struct ShipClient {
 impl ShipClient {
     /// Connect and complete the handshake (receive the server's ABI).
     pub async fn connect(url: &str) -> Result<Self> {
-        let (ws, _response) = connect_async(url).await?;
+        // A chain booted from a snapshot import serves its entire imported
+        // chain-state as the first block's deltas -- one very large message
+        // (hundreds of MB), far above tungstenite's 16 MiB default cap.
+        let ws_config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
+            .max_message_size(None)
+            .max_frame_size(None);
+        let (ws, _response) = connect_async_with_config(url, Some(ws_config), false).await?;
         let mut client = ShipClient {
             ws,
             abi: serde_json::Value::Null,
