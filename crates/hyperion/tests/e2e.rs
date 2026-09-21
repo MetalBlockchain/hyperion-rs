@@ -391,6 +391,7 @@ struct PipelineOptions {
     batch_max_bytes: usize,
     bulk_delay_ms: u64,
     fail_bulk: bool,
+    decode_workers: usize,
 }
 
 impl Default for PipelineOptions {
@@ -402,6 +403,7 @@ impl Default for PipelineOptions {
             batch_max_bytes: 5 * 1024 * 1024,
             bulk_delay_ms: 0,
             fail_bulk: false,
+            decode_workers: 2,
         }
     }
 }
@@ -437,6 +439,7 @@ async fn run_pipeline_options(
     let stop_block = 41 + options.blocks;
     let batch_size = options.batch_size;
     let batch_max_bytes = options.batch_max_bytes;
+    let decode_workers = options.decode_workers;
 
     let config: Config = toml::from_str(&format!(
         r#"
@@ -451,6 +454,7 @@ async fn run_pipeline_options(
         stop_block = {stop_block}
         batch_size = {batch_size}
         batch_max_bytes = {batch_max_bytes}
+        decode_workers = {decode_workers}
 
         [elasticsearch]
         url = "http://{es_addr}"
@@ -509,6 +513,38 @@ async fn drains_ordered_batches_with_a_slow_writer() {
 }
 
 #[tokio::test]
+async fn parallel_decoding_matches_inline_documents() {
+    let expected = run_pipeline_options(
+        "antelope",
+        PipelineOptions {
+            blocks: 12,
+            transactions: 4,
+            decode_workers: 0,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    for workers in [1, 2, 4] {
+        let actual = run_pipeline_options(
+            "antelope",
+            PipelineOptions {
+                blocks: 12,
+                transactions: 4,
+                decode_workers: workers,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            actual, expected,
+            "documents differ with {workers} decoder workers"
+        );
+    }
+}
+
+#[tokio::test]
 async fn propagates_bulk_item_failures() {
     let error = run_pipeline_options(
         "antelope",
@@ -531,27 +567,30 @@ async fn propagates_bulk_item_failures() {
 #[ignore = "synthetic throughput benchmark; run explicitly in release mode"]
 async fn benchmark_pipeline() {
     let blocks = 4000;
-    for delay in [0, 10] {
-        let start = std::time::Instant::now();
-        let docs = run_pipeline_options(
-            "antelope",
-            PipelineOptions {
-                blocks,
-                transactions: 16,
-                bulk_delay_ms: delay,
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
-        let elapsed = start.elapsed();
-        assert_eq!(docs.len(), blocks as usize * 20);
-        eprintln!(
-            "bulk_delay_ms={delay}: {blocks} blocks, {} docs in {:.3}s ({:.0} blocks/s)",
+    for workers in [0, 1, 2, 4] {
+        for delay in [0, 10] {
+            let start = std::time::Instant::now();
+            let docs = run_pipeline_options(
+                "antelope",
+                PipelineOptions {
+                    blocks,
+                    transactions: 16,
+                    bulk_delay_ms: delay,
+                    decode_workers: workers,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            let elapsed = start.elapsed();
+            assert_eq!(docs.len(), blocks as usize * 20);
+            eprintln!(
+            "decode_workers={workers}, bulk_delay_ms={delay}: {blocks} blocks, {} docs in {:.3}s ({:.0} blocks/s)",
             docs.len(),
             elapsed.as_secs_f64(),
             blocks as f64 / elapsed.as_secs_f64()
         );
+        }
     }
 }
 

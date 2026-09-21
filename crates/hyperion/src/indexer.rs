@@ -1,16 +1,17 @@
-//! The indexing pipeline: SHIP reader task → processor → Elasticsearch
-//! bulk writer. Hyperion uses RabbitMQ between these stages; here they are
+//! The indexing pipeline: SHIP reader → parallel raw decoders → ordered
+//! processor → Elasticsearch bulk writer. Hyperion uses RabbitMQ between
+//! these stages; here they are
 //! in-process tasks connected by bounded channels, with SHIP's own
 //! credit-based flow control providing end-to-end backpressure.
 
 use crate::abis::AbiCache;
 use crate::config::Config;
 use crate::elastic::{index_definitions, Elastic};
-use crate::processor::{Doc, Op, Processor};
+use crate::processor::{DecodedBlock, Doc, Op, Processor};
 use anyhow::{Context, Result};
 use serde::Serialize;
 use ship::{GetBlocksRequest, GetBlocksResult, ShipClient, ShipResult};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
@@ -119,7 +120,19 @@ pub async fn run(config: Config) -> Result<()> {
     // the socket reader nor pending writes can outlive this indexing run.
     let mut stages = tokio::task::JoinSet::new();
     stages.spawn(reader);
-    stages.spawn(async move { process_blocks(&config, rx, batch_tx).await });
+    let input = if config.indexer.decode_workers == 0 {
+        BlockInput::Raw(rx)
+    } else {
+        let (decoded_tx, decoded_rx) = mpsc::channel(2);
+        let workers = config.indexer.decode_workers;
+        stages.spawn(decode_blocks(rx, decoded_tx, workers, DecodedBlock::decode));
+        BlockInput::Decoded(decoded_rx)
+    };
+    tracing::info!(
+        decode_workers = config.indexer.decode_workers,
+        "started indexing pipeline"
+    );
+    stages.spawn(async move { process_blocks(&config, input, batch_tx).await });
     stages.spawn(async move { write_batches(&es, batch_rx).await });
     while let Some(result) = stages.join_next().await {
         result??;
@@ -128,9 +141,75 @@ pub async fn run(config: Config) -> Result<()> {
     Ok(())
 }
 
+enum BlockInput {
+    Raw(mpsc::Receiver<Box<GetBlocksResult>>),
+    Decoded(mpsc::Receiver<DecodedBlock>),
+}
+
+impl BlockInput {
+    async fn recv(&mut self) -> Option<Result<DecodedBlock>> {
+        match self {
+            Self::Raw(rx) => rx.recv().await.map(|raw| DecodedBlock::decode(&raw)),
+            Self::Decoded(rx) => rx.recv().await.map(Ok),
+        }
+    }
+}
+
+/// Bound running jobs AND completed results waiting for an earlier block.
+/// Sorting by stream ordinal (not block number) preserves microfork replay.
+async fn decode_blocks<F>(
+    mut rx: mpsc::Receiver<Box<GetBlocksResult>>,
+    tx: mpsc::Sender<DecodedBlock>,
+    workers: usize,
+    decode: F,
+) -> Result<()>
+where
+    F: Fn(&GetBlocksResult) -> Result<DecodedBlock> + Send + Sync + Clone + 'static,
+{
+    anyhow::ensure!(workers > 0, "decoder pool needs at least one worker");
+    let mut jobs = tokio::task::JoinSet::new();
+    let mut ready = BTreeMap::new();
+    let mut submitted = 0u64;
+    let mut emitted = 0u64;
+    let mut closed = false;
+    loop {
+        if let Some(decoded) = ready.remove(&emitted) {
+            tx.send(decoded?).await?;
+            emitted += 1;
+            continue;
+        }
+        if closed && jobs.is_empty() {
+            return Ok(());
+        }
+        tokio::select! {
+            raw = rx.recv(), if !closed && jobs.len() + ready.len() < workers => {
+                match raw {
+                    Some(raw) => {
+                        let ordinal = submitted;
+                        submitted += 1;
+                        let decode = decode.clone();
+                        jobs.spawn_blocking(move || {
+                            let block_num = raw.this_block.as_ref().map(|b| b.block_num);
+                            let decoded = decode(&raw)
+                                .with_context(|| format!("decoding SHIP block {block_num:?}"));
+                            (ordinal, decoded)
+                        });
+                    }
+                    None => closed = true,
+                }
+            }
+            result = jobs.join_next(), if !jobs.is_empty() => {
+                let (ordinal, decoded) = result.expect("nonempty decoder jobs")
+                    .context("raw block decoder task failed")?;
+                ready.insert(ordinal, decoded);
+            }
+        }
+    }
+}
+
 async fn process_blocks(
     config: &Config,
-    mut rx: mpsc::Receiver<Box<GetBlocksResult>>,
+    mut rx: BlockInput,
     tx: mpsc::Sender<BulkBatch>,
 ) -> Result<()> {
     let system_account: antelope::Name = config
@@ -161,6 +240,7 @@ async fn process_blocks(
             }
         };
         let Some(block) = block else { break };
+        let block = block?;
 
         if let Some(this_block) = &block.this_block {
             if last_block > 0 && this_block.block_num <= last_block {
@@ -173,7 +253,7 @@ async fn process_blocks(
             last_block = this_block.block_num;
         }
 
-        for doc in processor.process_block(&block, &mut abis).await? {
+        for doc in processor.process_decoded(&block, &mut abis).await? {
             batch.push(&indices[doc.kind], &doc)?;
         }
         blocks_since_report += 1;
@@ -322,11 +402,111 @@ mod tests {
         .unwrap()
     }
 
+    #[tokio::test]
+    async fn decoder_pool_is_parallel_bounded_and_preserves_fork_arrival_order() {
+        use std::sync::{Arc, Mutex};
+        let (input, rx) = mpsc::channel(4);
+        let (tx, mut output) = mpsc::channel(1);
+        let (started, mut events) = mpsc::unbounded_channel();
+        let (release, wait) = std::sync::mpsc::channel();
+        let wait = Arc::new(Mutex::new(wait));
+        let decoder = move |raw: &GetBlocksResult| {
+            let number = raw.this_block.as_ref().unwrap().block_num;
+            started.send(number).unwrap();
+            if number == 100 {
+                wait.lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap();
+            }
+            DecodedBlock::decode(raw)
+        };
+        let pool = tokio::spawn(decode_blocks(rx, tx, 2, decoder));
+        // A backwards jump and a repeated height must not be sorted by height.
+        for number in [100, 101, 99, 99] {
+            input.send(block(number)).await.unwrap();
+        }
+        let mut first = Vec::new();
+        for _ in 0..2 {
+            first.push(
+                tokio::time::timeout(Duration::from_secs(5), events.recv())
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            );
+        }
+        first.sort_unstable();
+        assert_eq!(
+            first,
+            vec![100, 101],
+            "second worker must run while first is blocked"
+        );
+        assert!(
+            output.try_recv().is_err(),
+            "later block must not overtake earlier block"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), events.recv())
+                .await
+                .is_err(),
+            "completed results must count towards the outstanding work limit"
+        );
+        assert_eq!(input.capacity(), 2);
+        release.send(()).unwrap();
+        drop(input);
+        let mut numbers = Vec::new();
+        while let Some(decoded) = tokio::time::timeout(Duration::from_secs(5), output.recv())
+            .await
+            .unwrap()
+        {
+            numbers.push(decoded.this_block.unwrap().block_num);
+        }
+        assert_eq!(numbers, vec![100, 101, 99, 99]);
+        pool.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn decoder_pool_reports_malformed_payloads_and_panics() {
+        for malformed_traces in [true, false] {
+            let (input, rx) = mpsc::channel(1);
+            let (tx, mut output) = mpsc::channel(1);
+            let mut raw = block(42);
+            if malformed_traces {
+                raw.traces = Some(vec![255]);
+            } else {
+                raw.deltas = Some(vec![255]);
+            }
+            input.send(raw).await.unwrap();
+            drop(input);
+            let error = decode_blocks(rx, tx, 2, DecodedBlock::decode)
+                .await
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("decoding SHIP block Some(42)"),
+                "{error}"
+            );
+            assert!(output.recv().await.is_none());
+        }
+        let (input, rx) = mpsc::channel(1);
+        let (tx, mut output) = mpsc::channel(1);
+        input.send(block(42)).await.unwrap();
+        drop(input);
+        let error = decode_blocks(rx, tx, 2, |_| panic!("injected decoder panic"))
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("raw block decoder task failed"),
+            "{error}"
+        );
+        assert!(output.recv().await.is_none());
+    }
+
     #[tokio::test(start_paused = true)]
     async fn partial_batch_flush_deadline_does_not_reset_on_arrival() {
         let (input, rx) = mpsc::channel(2);
         let (tx, mut output) = mpsc::channel(2);
-        let processor = tokio::spawn(async move { process_blocks(&config(), rx, tx).await });
+        let processor =
+            tokio::spawn(async move { process_blocks(&config(), BlockInput::Raw(rx), tx).await });
         input.send(block(1)).await.unwrap();
         tokio::task::yield_now().await;
         tokio::time::advance(Duration::from_millis(40)).await;
