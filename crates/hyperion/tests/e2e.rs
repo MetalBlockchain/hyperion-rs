@@ -207,19 +207,29 @@ fn status_result() -> Vec<u8> {
 }
 
 fn blocks_result() -> Vec<u8> {
+    blocks_result_at(42, 1)
+}
+
+fn blocks_result_at(block_num: u32, transactions: u32) -> Vec<u8> {
     let mut buf = Vec::new();
     push_varuint32(&mut buf, 1); // get_blocks_result_v0
     push_block_position(&mut buf, 100, 0x0a); // head
     push_block_position(&mut buf, 90, 0x0b); // lib
     buf.push(1);
-    push_block_position(&mut buf, 42, 0xab); // this_block
+    push_block_position(&mut buf, block_num, 0xab); // this_block
     buf.push(1);
-    push_block_position(&mut buf, 41, 0xac); // prev_block
-                                             // Field order per the SHIP ABI: block, traces, deltas.
+    push_block_position(&mut buf, block_num - 1, 0xac); // prev_block
+                                                        // Field order per the SHIP ABI: block, traces, deltas.
     buf.push(1);
     push_bytes(&mut buf, &block_payload());
     buf.push(1);
-    push_bytes(&mut buf, &traces_payload());
+    let trace = traces_payload();
+    let mut traces = Vec::new();
+    push_varuint32(&mut traces, transactions);
+    for _ in 0..transactions {
+        traces.extend_from_slice(&trace[1..]);
+    }
+    push_bytes(&mut buf, &traces);
     buf.push(1);
     push_bytes(&mut buf, &deltas_payload());
     buf
@@ -317,7 +327,7 @@ async fn mock_es_handler(
     }
 }
 
-async fn run_mock_ship(listener: tokio::net::TcpListener) {
+async fn run_mock_ship(listener: tokio::net::TcpListener, transactions: u32) {
     let (stream, _) = listener.accept().await.expect("ship accept");
     let mut ws = tokio_tungstenite::accept_async(stream)
         .await
@@ -327,24 +337,39 @@ async fn run_mock_ship(listener: tokio::net::TcpListener) {
         .await
         .unwrap();
     // 2. serve requests
+    let mut next_block = 42;
+    let mut end_block = 42;
     while let Some(Ok(msg)) = ws.next().await {
         let Message::Binary(data) = msg else { continue };
-        match data.first() {
-            Some(0) => ws
-                .send(Message::Binary(status_result().into()))
-                .await
-                .unwrap(),
+        let credit = match data.first() {
+            Some(0) => {
+                ws.send(Message::Binary(status_result().into()))
+                    .await
+                    .unwrap();
+                0
+            }
             Some(1) => {
                 // get_blocks_request_v0: verify requested range
                 let start = u32::from_le_bytes(data[1..5].try_into().unwrap());
                 let end = u32::from_le_bytes(data[5..9].try_into().unwrap());
                 assert_eq!(start, 42);
-                assert_eq!(end, 43);
-                ws.send(Message::Binary(blocks_result().into()))
-                    .await
-                    .unwrap();
+                next_block = start;
+                end_block = end;
+                u32::from_le_bytes(data[9..13].try_into().unwrap())
             }
-            _ => {} // acks
+            Some(2) => u32::from_le_bytes(data[1..5].try_into().unwrap()),
+            _ => 0,
+        };
+        for _ in 0..credit.min(end_block - next_block) {
+            let payload = if next_block == 42 && transactions == 1 {
+                blocks_result()
+            } else {
+                blocks_result_at(next_block, transactions)
+            };
+            if ws.send(Message::Binary(payload.into())).await.is_err() {
+                return;
+            }
+            next_block += 1;
         }
     }
 }
@@ -354,17 +379,64 @@ async fn run_mock_ship(listener: tokio::net::TcpListener) {
 /// Spin up the mock SHIP + mock ES/chain-API servers, run the real indexer
 /// over one block, and return the (index, doc) pairs captured from `_bulk`.
 async fn run_pipeline(chain_api: &str) -> Vec<(String, Value)> {
+    run_pipeline_options(chain_api, PipelineOptions::default())
+        .await
+        .unwrap()
+}
+
+struct PipelineOptions {
+    blocks: u32,
+    transactions: u32,
+    batch_size: usize,
+    batch_max_bytes: usize,
+    bulk_delay_ms: u64,
+    fail_bulk: bool,
+}
+
+impl Default for PipelineOptions {
+    fn default() -> Self {
+        Self {
+            blocks: 1,
+            transactions: 1,
+            batch_size: 2000,
+            batch_max_bytes: 5 * 1024 * 1024,
+            bulk_delay_ms: 0,
+            fail_bulk: false,
+        }
+    }
+}
+
+async fn run_pipeline_options(
+    chain_api: &str,
+    options: PipelineOptions,
+) -> anyhow::Result<Vec<(String, Value)>> {
     let es_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let es_addr = es_listener.local_addr().unwrap();
     let bulk_log: BulkLog = Arc::new(Mutex::new(Vec::new()));
     let app = Router::new()
-        .fallback(mock_es_handler)
-        .with_state(bulk_log.clone());
-    tokio::spawn(async move { axum::serve(es_listener, app).await.unwrap() });
+        .fallback(move |state: State<BulkLog>, method: Method, uri: Uri, body: Bytes| async move {
+            if uri.path() == "/_bulk" {
+                tokio::time::sleep(std::time::Duration::from_millis(options.bulk_delay_ms)).await;
+                if options.fail_bulk {
+                    return (StatusCode::OK, json!({"errors": true, "items": [
+                        {"index": {"status": 429, "error": {"type": "es_rejected_execution_exception"}}}
+                    ]}).to_string()).into_response();
+                }
+            }
+            mock_es_handler(state, method, uri, body).await.into_response()
+        })
+        .with_state(bulk_log.clone())
+        .layer(axum::extract::DefaultBodyLimit::disable());
+    let mut servers = tokio::task::JoinSet::new();
+    servers.spawn(async move { axum::serve(es_listener, app).await.unwrap() });
 
     let ship_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let ship_addr = ship_listener.local_addr().unwrap();
-    tokio::spawn(run_mock_ship(ship_listener));
+    servers.spawn(run_mock_ship(ship_listener, options.transactions));
+
+    let stop_block = 41 + options.blocks;
+    let batch_size = options.batch_size;
+    let batch_max_bytes = options.batch_max_bytes;
 
     let config: Config = toml::from_str(&format!(
         r#"
@@ -376,7 +448,9 @@ async fn run_pipeline(chain_api: &str) -> Vec<(String, Value)> {
 
         [indexer]
         start_block = 42
-        stop_block = 42
+        stop_block = {stop_block}
+        batch_size = {batch_size}
+        batch_max_bytes = {batch_max_bytes}
 
         [elasticsearch]
         url = "http://{es_addr}"
@@ -389,8 +463,7 @@ async fn run_pipeline(chain_api: &str) -> Vec<(String, Value)> {
         hyperion::indexer::run(config),
     )
     .await
-    .expect("indexer timed out")
-    .expect("indexer failed");
+    .expect("indexer timed out")?;
 
     // Parse every doc out of the captured bulk bodies: action lines are
     // `{"index": {...}}\n{doc}` pairs.
@@ -405,7 +478,81 @@ async fn run_pipeline(chain_api: &str) -> Vec<(String, Value)> {
             }
         }
     }
-    docs
+    Ok(docs)
+}
+
+#[tokio::test]
+async fn drains_ordered_batches_with_a_slow_writer() {
+    // Force both document-count and byte-size flushes in separate runs.
+    for (batch_size, batch_max_bytes) in [(1, i64::MAX as usize), (i64::MAX as usize, 1)] {
+        let docs = run_pipeline_options(
+            "antelope",
+            PipelineOptions {
+                blocks: 12,
+                batch_size,
+                batch_max_bytes,
+                bulk_delay_ms: 2,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        for kind in ["block", "action", "delta", "token", "perm"] {
+            let numbers: Vec<_> = docs
+                .iter()
+                .filter(|(index, _)| index == &format!("test-{kind}"))
+                .map(|(_, doc)| doc["block_num"].as_u64().unwrap())
+                .collect();
+            assert_eq!(numbers, (42..54).collect::<Vec<_>>(), "{kind} write order");
+        }
+    }
+}
+
+#[tokio::test]
+async fn propagates_bulk_item_failures() {
+    let error = run_pipeline_options(
+        "antelope",
+        PipelineOptions {
+            blocks: 12,
+            batch_size: 1,
+            fail_bulk: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("bulk indexing failed"),
+        "{error}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "synthetic throughput benchmark; run explicitly in release mode"]
+async fn benchmark_pipeline() {
+    let blocks = 4000;
+    for delay in [0, 10] {
+        let start = std::time::Instant::now();
+        let docs = run_pipeline_options(
+            "antelope",
+            PipelineOptions {
+                blocks,
+                transactions: 16,
+                bulk_delay_ms: delay,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let elapsed = start.elapsed();
+        assert_eq!(docs.len(), blocks as usize * 20);
+        eprintln!(
+            "bulk_delay_ms={delay}: {blocks} blocks, {} docs in {:.3}s ({:.0} blocks/s)",
+            docs.len(),
+            elapsed.as_secs_f64(),
+            blocks as f64 / elapsed.as_secs_f64()
+        );
+    }
 }
 
 /// The chain API is only consulted for ABI cache misses; with `pulsevm` the

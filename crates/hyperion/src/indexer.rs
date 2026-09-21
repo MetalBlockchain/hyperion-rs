@@ -1,6 +1,6 @@
 //! The indexing pipeline: SHIP reader task → processor → Elasticsearch
 //! bulk writer. Hyperion uses RabbitMQ between these stages; here they are
-//! in-process tasks connected by a bounded channel, with SHIP's own
+//! in-process tasks connected by bounded channels, with SHIP's own
 //! credit-based flow control providing end-to-end backpressure.
 
 use crate::abis::AbiCache;
@@ -8,11 +8,27 @@ use crate::config::Config;
 use crate::elastic::{index_definitions, Elastic};
 use crate::processor::{Doc, Op, Processor};
 use anyhow::{Context, Result};
+use serde::Serialize;
 use ship::{GetBlocksRequest, GetBlocksResult, ShipClient, ShipResult};
-use std::time::{Duration, Instant};
+use std::collections::HashMap;
+use std::time::Duration;
 use tokio::sync::mpsc;
+use tokio::time::Instant;
 
 pub async fn run(config: Config) -> Result<()> {
+    anyhow::ensure!(
+        config.indexer.max_messages_in_flight > 0,
+        "max_messages_in_flight must be positive"
+    );
+    anyhow::ensure!(config.indexer.batch_size > 0, "batch_size must be positive");
+    anyhow::ensure!(
+        config.indexer.batch_max_bytes > 0,
+        "batch_max_bytes must be positive"
+    );
+    anyhow::ensure!(
+        config.indexer.flush_interval_ms > 0,
+        "flush_interval_ms must be positive"
+    );
     let es = Elastic::new(&config.elasticsearch);
     let info = es.ping().await.context("cannot reach elasticsearch")?;
     tracing::info!(version = %info["version"]["number"], "connected to elasticsearch");
@@ -66,10 +82,10 @@ pub async fn run(config: Config) -> Result<()> {
 
     // Reader task: pull frames off the socket, refill SHIP credit as the
     // channel accepts each block (bounded channel = backpressure).
-    let (tx, mut rx) = mpsc::channel::<Box<GetBlocksResult>>(
+    let (tx, rx) = mpsc::channel::<Box<GetBlocksResult>>(
         config.indexer.max_messages_in_flight.max(1) as usize,
     );
-    let reader = tokio::spawn(async move {
+    let reader = async move {
         loop {
             match client.next_result().await {
                 Ok(ShipResult::Blocks(block)) => {
@@ -93,8 +109,30 @@ pub async fn run(config: Config) -> Result<()> {
                 Err(e) => return Err(anyhow::Error::from(e).context("state history stream")),
             }
         }
-    });
+    };
 
+    // Keep writes ordered: concurrent requests could let older token balances,
+    // permission changes, or fork replacements overwrite newer documents.
+    // Two queued batches bound how far processing can run ahead of the writer.
+    let (batch_tx, batch_rx) = mpsc::channel(2);
+    // JoinSet aborts the remaining stages on error or cancellation, so neither
+    // the socket reader nor pending writes can outlive this indexing run.
+    let mut stages = tokio::task::JoinSet::new();
+    stages.spawn(reader);
+    stages.spawn(async move { process_blocks(&config, rx, batch_tx).await });
+    stages.spawn(async move { write_batches(&es, batch_rx).await });
+    while let Some(result) = stages.join_next().await {
+        result??;
+    }
+    tracing::info!("indexer finished");
+    Ok(())
+}
+
+async fn process_blocks(
+    config: &Config,
+    mut rx: mpsc::Receiver<Box<GetBlocksResult>>,
+    tx: mpsc::Sender<BulkBatch>,
+) -> Result<()> {
     let system_account: antelope::Name = config
         .chain
         .system_account
@@ -102,7 +140,11 @@ pub async fn run(config: Config) -> Result<()> {
         .map_err(|e| anyhow::anyhow!("bad chain.system_account: {e}"))?;
     let processor = Processor::new(&config.indexer.skip_actions, system_account);
     let mut abis = AbiCache::new(config.chain.client());
-    let mut batch: Vec<Doc> = Vec::new();
+    let indices: HashMap<_, _> = ["action", "block", "delta", "abi", "perm", "token"]
+        .into_iter()
+        .map(|kind| (kind, config.index(kind)))
+        .collect();
+    let mut batch = BulkBatch::default();
     let mut last_flush = Instant::now();
     let mut last_report = Instant::now();
     let mut blocks_since_report = 0u64;
@@ -112,8 +154,8 @@ pub async fn run(config: Config) -> Result<()> {
     loop {
         let block = tokio::select! {
             block = rx.recv() => block,
-            _ = tokio::time::sleep(flush_interval), if !batch.is_empty() => {
-                flush(&es, &config, &mut batch).await?;
+            _ = tokio::time::sleep_until(last_flush + flush_interval), if batch.count > 0 => {
+                tx.send(std::mem::take(&mut batch)).await?;
                 last_flush = Instant::now();
                 continue;
             }
@@ -131,11 +173,17 @@ pub async fn run(config: Config) -> Result<()> {
             last_block = this_block.block_num;
         }
 
-        batch.extend(processor.process_block(&block, &mut abis).await?);
+        for doc in processor.process_block(&block, &mut abis).await? {
+            batch.push(&indices[doc.kind], &doc)?;
+        }
         blocks_since_report += 1;
 
-        if batch.len() >= config.indexer.batch_size || last_flush.elapsed() >= flush_interval {
-            flush(&es, &config, &mut batch).await?;
+        if batch.count > 0
+            && (batch.count >= config.indexer.batch_size
+                || batch.body.len() >= config.indexer.batch_max_bytes
+                || last_flush.elapsed() >= flush_interval)
+        {
+            tx.send(std::mem::take(&mut batch)).await?;
             last_flush = Instant::now();
         }
         if last_report.elapsed() >= Duration::from_secs(10) {
@@ -146,9 +194,9 @@ pub async fn run(config: Config) -> Result<()> {
         }
     }
 
-    flush(&es, &config, &mut batch).await?;
-    reader.await??;
-    tracing::info!(last_block, "indexer finished");
+    if batch.count > 0 {
+        tx.send(batch).await?;
+    }
     Ok(())
 }
 
@@ -171,40 +219,202 @@ async fn resolve_start_block(config: &Config, es: &Elastic) -> Result<u32> {
     Ok(1)
 }
 
-async fn flush(es: &Elastic, config: &Config, batch: &mut Vec<Doc>) -> Result<()> {
-    if batch.is_empty() {
-        return Ok(());
-    }
-    let mut body = String::with_capacity(batch.len() * 256);
-    for doc in batch.iter() {
-        let index = config.index(doc.kind);
+#[derive(Default)]
+struct BulkBatch {
+    body: Vec<u8>,
+    count: usize,
+}
+
+#[derive(Serialize)]
+struct BulkMetadata<'a> {
+    #[serde(rename = "_index")]
+    index: &'a str,
+    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
+    id: Option<&'a str>,
+}
+
+impl BulkBatch {
+    fn push(&mut self, index: &str, doc: &Doc) -> Result<()> {
+        let meta = BulkMetadata {
+            index,
+            id: doc.id.as_deref(),
+        };
         match doc.op {
             Op::Index => {
-                let meta = match &doc.id {
-                    Some(id) => serde_json::json!({"index": {"_index": index, "_id": id}}),
-                    None => serde_json::json!({"index": {"_index": index}}),
-                };
-                body.push_str(&meta.to_string());
-                body.push('\n');
-                body.push_str(&doc.body.to_string());
-                body.push('\n');
+                self.body.extend_from_slice(b"{\"index\":");
+                serde_json::to_writer(&mut self.body, &meta)?;
+                self.body.extend_from_slice(b"}\n");
+                serde_json::to_writer(&mut self.body, &doc.body)?;
+                self.body.push(b'\n');
             }
             Op::Delete => {
-                let id = doc.id.as_deref().unwrap_or_default();
-                body.push_str(
-                    &serde_json::json!({"delete": {"_index": index, "_id": id}}).to_string(),
-                );
-                body.push('\n');
+                anyhow::ensure!(meta.id.is_some(), "delete requires a document ID");
+                self.body.extend_from_slice(b"{\"delete\":");
+                serde_json::to_writer(&mut self.body, &meta)?;
+                self.body.extend_from_slice(b"}\n");
             }
         }
+        self.count += 1;
+        Ok(())
     }
-    let count = batch.len();
-    batch.clear();
-    let failed = es.bulk(body).await?;
-    if failed > 0 {
-        tracing::error!(failed, count, "bulk indexing had failures");
-    } else {
-        tracing::debug!(count, "flushed batch");
+}
+
+async fn write_batches(es: &Elastic, mut rx: mpsc::Receiver<BulkBatch>) -> Result<()> {
+    while let Some(batch) = rx.recv().await {
+        let count = batch.count;
+        let bytes = batch.body.len();
+        let started = Instant::now();
+        let failed = es.bulk(batch.body).await?;
+        // Do not submit newer batches after a failed write: doing so would
+        // advance the resume position past documents that were never indexed.
+        anyhow::ensure!(
+            failed == 0,
+            "bulk indexing failed for {failed} of {count} documents"
+        );
+        tracing::debug!(
+            count,
+            bytes,
+            elapsed_ms = started.elapsed().as_millis(),
+            "flushed batch"
+        );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::{json, Value};
+
+    fn block(number: u32) -> Box<GetBlocksResult> {
+        // Empty signed block: fixed header, no producer schedule or header
+        // extensions, K1 signature, and zero transaction receipts.
+        let mut header = vec![0; 4 + 8 + 2 + 32 * 3 + 4];
+        header.extend_from_slice(&[0, 0, 0]);
+        header.extend_from_slice(&[0; 65]);
+        header.push(0);
+        let position = ship::BlockPosition {
+            block_num: number,
+            block_id: "00".repeat(32),
+        };
+        Box::new(GetBlocksResult {
+            head: position.clone(),
+            last_irreversible: position.clone(),
+            this_block: Some(position),
+            prev_block: None,
+            block: Some(header),
+            traces: None,
+            deltas: None,
+        })
+    }
+
+    fn config() -> Config {
+        toml::from_str(
+            r#"
+            [chain]
+            name = "test"
+            http = "http://127.0.0.1:1"
+            ship = "ws://127.0.0.1:1"
+            [indexer]
+            flush_interval_ms = 50
+        "#,
+        )
+        .unwrap()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn partial_batch_flush_deadline_does_not_reset_on_arrival() {
+        let (input, rx) = mpsc::channel(2);
+        let (tx, mut output) = mpsc::channel(2);
+        let processor = tokio::spawn(async move { process_blocks(&config(), rx, tx).await });
+        input.send(block(1)).await.unwrap();
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(40)).await;
+        input.send(block(2)).await.unwrap();
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(10)).await;
+        let batch = tokio::time::timeout(Duration::from_millis(2), output.recv())
+            .await
+            .expect("partial batch deadline was postponed")
+            .unwrap();
+        assert_eq!(batch.count, 2);
+        drop(input);
+        processor.await.unwrap().unwrap();
+        assert!(output.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn writer_stops_before_submitting_queued_batches_after_failure() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        let requests = Arc::new(AtomicUsize::new(0));
+        let counter = requests.clone();
+        let app = axum::Router::new().route(
+            "/_bulk",
+            axum::routing::post(move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+                async {
+                    axum::Json(json!({"errors": true, "items": [
+                        {"index": {"status": 429, "error": {"type": "rejected"}}}
+                    ]}))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = config();
+        config.elasticsearch.url = format!("http://{}", listener.local_addr().unwrap());
+        let mut servers = tokio::task::JoinSet::new();
+        servers.spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let (tx, rx) = mpsc::channel(2);
+        for _ in 0..2 {
+            tx.send(BulkBatch {
+                count: 1,
+                body: b"{}\n".to_vec(),
+            })
+            .await
+            .unwrap();
+        }
+        drop(tx);
+        let error = write_batches(&Elastic::new(&config.elasticsearch), rx)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("bulk indexing failed"));
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn serializes_index_and_delete_operations_with_escaped_metadata() {
+        let mut batch = BulkBatch::default();
+        let mut doc = Doc {
+            kind: "action",
+            id: Some("quoted\"id\n".into()),
+            body: json!({"memo": "line one\nline two", "value": 42}),
+            op: Op::Index,
+        };
+        batch.push("test-action", &doc).unwrap();
+        doc.id = None;
+        batch.push("test-action", &doc).unwrap();
+        doc.op = Op::Delete;
+        doc.id = Some("balance".into());
+        batch.push("test-token", &doc).unwrap();
+        assert_eq!(batch.count, 3);
+        assert!(batch.body.ends_with(b"\n"));
+        let body = String::from_utf8(batch.body).unwrap();
+        let lines: Vec<Value> = body
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            lines,
+            vec![
+                json!({"index": {"_index": "test-action", "_id": "quoted\"id\n"}}),
+                doc.body.clone(),
+                json!({"index": {"_index": "test-action"}}),
+                doc.body,
+                json!({"delete": {"_index": "test-token", "_id": "balance"}}),
+            ]
+        );
+    }
 }

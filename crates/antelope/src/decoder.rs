@@ -6,27 +6,83 @@
 use crate::{keys, time, Abi, AntelopeError, Asset, ByteReader, Name, Result, Symbol, SymbolCode};
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::ops::Deref;
+use std::sync::Arc;
+
+enum AbiSource<'a> {
+    Borrowed(&'a Abi),
+    Shared(Arc<Abi>),
+}
+
+impl Deref for AbiSource<'_> {
+    type Target = Abi;
+
+    fn deref(&self) -> &Abi {
+        match self {
+            Self::Borrowed(abi) => abi,
+            Self::Shared(abi) => abi,
+        }
+    }
+}
 
 pub struct AbiDecoder<'a> {
-    abi: &'a Abi,
-    aliases: HashMap<&'a str, &'a str>,
-    structs: HashMap<&'a str, &'a crate::abi::StructDef>,
-    variants: HashMap<&'a str, &'a crate::abi::VariantDef>,
+    abi: AbiSource<'a>,
+    aliases: HashMap<String, usize>,
+    structs: HashMap<String, usize>,
+    variants: HashMap<String, usize>,
+    actions: HashMap<Name, usize>,
+    tables: HashMap<Name, usize>,
 }
 
 const MAX_DEPTH: u32 = 64;
 
 impl<'a> AbiDecoder<'a> {
     pub fn new(abi: &'a Abi) -> Self {
+        Self::build(AbiSource::Borrowed(abi))
+    }
+
+    /// Prepare a reusable decoder that owns a shared ABI. Lookup tables are
+    /// built once and reused across actions, rows, and blocks.
+    pub fn from_shared(abi: Arc<Abi>) -> AbiDecoder<'static> {
+        AbiDecoder::build(AbiSource::Shared(abi))
+    }
+
+    fn build(abi: AbiSource<'a>) -> Self {
         AbiDecoder {
-            abi,
             aliases: abi
                 .types
                 .iter()
-                .map(|t| (t.new_type_name.as_str(), t.type_.as_str()))
+                .enumerate()
+                .map(|(i, t)| (t.new_type_name.clone(), i))
                 .collect(),
-            structs: abi.structs.iter().map(|s| (s.name.as_str(), s)).collect(),
-            variants: abi.variants.iter().map(|v| (v.name.as_str(), v)).collect(),
+            structs: abi
+                .structs
+                .iter()
+                .enumerate()
+                .map(|(i, s)| (s.name.clone(), i))
+                .collect(),
+            variants: abi
+                .variants
+                .iter()
+                .enumerate()
+                .map(|(i, v)| (v.name.clone(), i))
+                .collect(),
+            // Reverse iteration preserves the first-match semantics of ABI lookups.
+            actions: abi
+                .actions
+                .iter()
+                .enumerate()
+                .rev()
+                .map(|(i, a)| (a.name, i))
+                .collect(),
+            tables: abi
+                .tables
+                .iter()
+                .enumerate()
+                .rev()
+                .map(|(i, t)| (t.name, i))
+                .collect(),
+            abi,
         }
     }
 
@@ -41,20 +97,20 @@ impl<'a> AbiDecoder<'a> {
     /// Decode the data payload of an action, resolving the action's struct
     /// type from the ABI.
     pub fn decode_action(&self, action: Name, data: &[u8]) -> Result<Value> {
-        let type_name = self
-            .abi
-            .action_type(action)
+        let index = self
+            .actions
+            .get(&action)
             .ok_or_else(|| AntelopeError::UnknownType(format!("action {action}")))?;
-        self.decode(type_name, data)
+        self.decode(&self.abi.actions[*index].type_, data)
     }
 
     /// Decode a table row, resolving the row struct type from the ABI.
     pub fn decode_table_row(&self, table: Name, data: &[u8]) -> Result<Value> {
-        let type_name = self
-            .abi
-            .table_type(table)
+        let index = self
+            .tables
+            .get(&table)
             .ok_or_else(|| AntelopeError::UnknownType(format!("table {table}")))?;
-        self.decode(type_name, data)
+        self.decode(&self.abi.tables[*index].type_, data)
     }
 
     fn decode_type(&self, type_name: &str, r: &mut ByteReader, depth: u32) -> Result<Value> {
@@ -88,10 +144,11 @@ impl<'a> AbiDecoder<'a> {
         if let Some(value) = self.decode_builtin(type_name, r, depth)? {
             return Ok(value);
         }
-        if let Some(def) = self.structs.get(type_name) {
-            return self.decode_struct(def, r, depth);
+        if let Some(&index) = self.structs.get(type_name) {
+            return self.decode_struct(&self.abi.structs[index], r, depth);
         }
-        if let Some(def) = self.variants.get(type_name) {
+        if let Some(&index) = self.variants.get(type_name) {
+            let def = &self.abi.variants[index];
             let index = r.read_varuint32()?;
             let inner =
                 def.types
@@ -105,8 +162,8 @@ impl<'a> AbiDecoder<'a> {
         }
         // Aliases may point at modified types (e.g. `permission[]`), so
         // resolve one step and re-enter; the depth guard breaks cycles.
-        if let Some(&next) = self.aliases.get(type_name) {
-            return self.decode_type(next, r, depth + 1);
+        if let Some(&index) = self.aliases.get(type_name) {
+            return self.decode_type(&self.abi.types[index].type_, r, depth + 1);
         }
         Err(AntelopeError::UnknownType(type_name.to_string()))
     }

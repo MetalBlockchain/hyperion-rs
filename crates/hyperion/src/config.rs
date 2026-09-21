@@ -53,6 +53,8 @@ pub struct IndexerConfig {
     pub max_messages_in_flight: u32,
     /// Documents per bulk request.
     pub batch_size: usize,
+    /// Target maximum serialized bulk size, checked after each complete block.
+    pub batch_max_bytes: usize,
     /// Max time a partial batch may wait before being flushed.
     pub flush_interval_ms: u64,
     /// Actions to skip, as `contract::action` (e.g. `eosio::onblock`).
@@ -69,6 +71,7 @@ impl Default for IndexerConfig {
             fetch_deltas: true,
             max_messages_in_flight: 128,
             batch_size: 2000,
+            batch_max_bytes: 5 * 1024 * 1024,
             flush_interval_ms: 500,
             skip_actions: Vec::new(),
         }

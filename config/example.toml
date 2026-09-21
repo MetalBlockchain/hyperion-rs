@@ -27,6 +27,9 @@ fetch_deltas = true
 max_messages_in_flight = 128
 # Documents per Elasticsearch bulk request.
 batch_size = 2000
+# Target serialized bulk size in bytes (5 MiB). Limits are checked after a
+# complete block, so a single large block may exceed either batch target.
+batch_max_bytes = 5242880
 # Max time (ms) a partial batch waits before being flushed.
 flush_interval_ms = 500
 # Actions to skip entirely, as "contract::action".

@@ -4,7 +4,7 @@
 //! ABI, permission and token-balance docs.
 
 use crate::abis::AbiCache;
-use antelope::{time, AbiDecoder, Asset, Name};
+use antelope::{time, Asset, Name};
 use serde_json::{json, Value};
 use ship::{
     AccountRow, ActionTrace, BlockHeader, ContractRow, GetBlocksResult, PermissionRow, TableDelta,
@@ -400,10 +400,8 @@ impl Processor {
         abis: &mut AbiCache,
         docs: &mut Vec<Doc>,
     ) {
-        let decoded = match abis.get_or_fetch(row.code).await {
-            Some(abi) => AbiDecoder::new(&abi)
-                .decode_table_row(row.table, &row.value)
-                .ok(),
+        let decoded = match abis.decoder(row.code).await {
+            Some(decoder) => decoder.decode_table_row(row.table, &row.value).ok(),
             None => None,
         };
 
@@ -491,8 +489,8 @@ async fn decode_action_data(
     if trace.act.data.is_empty() {
         return (Some(json!({})), None);
     }
-    if let Some(abi) = abis.get_or_fetch(trace.act.account).await {
-        if let Ok(value) = AbiDecoder::new(&abi).decode_action(trace.act.name, &trace.act.data) {
+    if let Some(decoder) = abis.decoder(trace.act.account).await {
+        if let Ok(value) = decoder.decode_action(trace.act.name, &trace.act.data) {
             return (Some(value), None);
         }
     }
