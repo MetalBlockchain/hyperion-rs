@@ -25,8 +25,14 @@ fetch_traces = true
 fetch_deltas = true
 # SHIP flow-control credit (blocks in flight before ack).
 max_messages_in_flight = 128
+# CPU workers for raw block decoding; 0 = decode inline. When omitted, use up
+# to 2 workers, leaving one available CPU for the rest of the pipeline.
+decode_workers = 2
 # Documents per Elasticsearch bulk request.
 batch_size = 2000
+# Target serialized bulk size in bytes (5 MiB). Limits are checked after a
+# complete block, so a single large block may exceed either batch target.
+batch_max_bytes = 5242880
 # Max time (ms) a partial batch waits before being flushed.
 flush_interval_ms = 500
 # Actions to skip entirely, as "contract::action".

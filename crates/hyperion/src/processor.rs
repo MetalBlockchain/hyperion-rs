@@ -4,14 +4,52 @@
 //! ABI, permission and token-balance docs.
 
 use crate::abis::AbiCache;
-use antelope::{time, AbiDecoder, Asset, Name};
+use antelope::{time, Asset, Name};
 use serde_json::{json, Value};
 use ship::{
-    AccountRow, ActionTrace, BlockHeader, ContractRow, GetBlocksResult, PermissionRow, TableDelta,
-    TransactionTrace,
+    AccountRow, ActionTrace, BlockHeader, BlockPosition, ContractRow, GetBlocksResult,
+    PermissionRow, TableDelta, TransactionTrace,
 };
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
+
+/// Wire decoding is independent of ABI state and can run ahead on CPU workers.
+/// ABI-dependent processing must still consume these in SHIP arrival order.
+pub(crate) struct DecodedBlock {
+    pub this_block: Option<BlockPosition>,
+    header: Option<BlockHeader>,
+    traces: Vec<TransactionTrace>,
+    deltas: Vec<TableDelta>,
+}
+
+impl DecodedBlock {
+    pub(crate) fn decode(result: &GetBlocksResult) -> anyhow::Result<Self> {
+        let mut decoded = Self {
+            this_block: result.this_block.clone(),
+            header: None,
+            traces: Vec::new(),
+            deltas: Vec::new(),
+        };
+        let Some(position) = &result.this_block else {
+            return Ok(decoded);
+        };
+        if let Some(bytes) = &result.block {
+            match BlockHeader::decode(bytes) {
+                Ok(header) => decoded.header = Some(header),
+                Err(error) => {
+                    tracing::warn!(block_num = position.block_num, %error, "failed to decode signed_block")
+                }
+            }
+        }
+        if let Some(bytes) = &result.traces {
+            decoded.traces = TransactionTrace::decode_traces(bytes)?;
+        }
+        if let Some(bytes) = &result.deltas {
+            decoded.deltas = TableDelta::decode_deltas(bytes)?;
+        }
+        Ok(decoded)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Op {
@@ -84,6 +122,15 @@ impl Processor {
         result: &GetBlocksResult,
         abis: &mut AbiCache,
     ) -> anyhow::Result<Vec<Doc>> {
+        self.process_decoded(&DecodedBlock::decode(result)?, abis)
+            .await
+    }
+
+    pub(crate) async fn process_decoded(
+        &self,
+        result: &DecodedBlock,
+        abis: &mut AbiCache,
+    ) -> anyhow::Result<Vec<Doc>> {
         let Some(this_block) = &result.this_block else {
             return Ok(Vec::new());
         };
@@ -91,16 +138,7 @@ impl Processor {
         let block_id = this_block.block_id.clone();
         let mut docs = Vec::new();
 
-        let header = match &result.block {
-            Some(bytes) => match BlockHeader::decode(bytes) {
-                Ok(h) => Some(h),
-                Err(e) => {
-                    tracing::warn!(block_num, error = %e, "failed to decode signed_block");
-                    None
-                }
-            },
-            None => None,
-        };
+        let header = &result.header;
         let timestamp = header
             .as_ref()
             .map(|h| time::block_timestamp_to_string(h.timestamp_slot));
@@ -124,34 +162,27 @@ impl Processor {
             ));
         }
 
-        if let Some(traces) = &result.traces {
-            let traces = TransactionTrace::decode_traces(traces)?;
-            for trace in &traces {
-                self.process_transaction(
-                    trace,
-                    block_num,
-                    &block_id,
-                    timestamp.as_deref(),
-                    producer.as_deref(),
-                    abis,
-                    &mut docs,
-                )
-                .await;
-            }
-        }
-
-        if let Some(deltas) = &result.deltas {
-            let deltas = TableDelta::decode_deltas(deltas)?;
-            self.process_deltas(
-                &deltas,
+        for trace in &result.traces {
+            self.process_transaction(
+                trace,
                 block_num,
                 &block_id,
                 timestamp.as_deref(),
+                producer.as_deref(),
                 abis,
                 &mut docs,
             )
             .await;
         }
+        self.process_deltas(
+            &result.deltas,
+            block_num,
+            &block_id,
+            timestamp.as_deref(),
+            abis,
+            &mut docs,
+        )
+        .await;
 
         Ok(docs)
     }
@@ -400,10 +431,8 @@ impl Processor {
         abis: &mut AbiCache,
         docs: &mut Vec<Doc>,
     ) {
-        let decoded = match abis.get_or_fetch(row.code).await {
-            Some(abi) => AbiDecoder::new(&abi)
-                .decode_table_row(row.table, &row.value)
-                .ok(),
+        let decoded = match abis.decoder(row.code).await {
+            Some(decoder) => decoder.decode_table_row(row.table, &row.value).ok(),
             None => None,
         };
 
@@ -491,8 +520,8 @@ async fn decode_action_data(
     if trace.act.data.is_empty() {
         return (Some(json!({})), None);
     }
-    if let Some(abi) = abis.get_or_fetch(trace.act.account).await {
-        if let Ok(value) = AbiDecoder::new(&abi).decode_action(trace.act.name, &trace.act.data) {
+    if let Some(decoder) = abis.decoder(trace.act.account).await {
+        if let Ok(value) = decoder.decode_action(trace.act.name, &trace.act.data) {
             return (Some(value), None);
         }
     }

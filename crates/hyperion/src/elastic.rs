@@ -79,20 +79,30 @@ impl Elastic {
     }
 
     /// Submit an NDJSON `_bulk` body. Returns the number of failed items.
-    pub async fn bulk(&self, body: String) -> Result<usize> {
+    pub async fn bulk(&self, body: impl Into<reqwest::Body>) -> Result<usize> {
         let res = self
-            .request(reqwest::Method::POST, "/_bulk")
+            .request(
+                reqwest::Method::POST,
+                "/_bulk?filter_path=errors,items.*.error,items.*.status",
+            )
             .header("content-type", "application/x-ndjson")
             .body(body)
             .send()
             .await
             .context("elasticsearch _bulk")?;
         let status = res.status();
-        let value: Value = res.json().await.unwrap_or(Value::Null);
         if !status.is_success() {
-            return Err(anyhow!("_bulk failed ({status}): {value}"));
+            let body = res.text().await.unwrap_or_default();
+            return Err(anyhow!("_bulk failed ({status}): {body}"));
         }
-        if value["errors"].as_bool() != Some(true) {
+        let value: Value = res
+            .json()
+            .await
+            .context("invalid elasticsearch _bulk response")?;
+        let errors = value["errors"]
+            .as_bool()
+            .context("missing errors flag in _bulk response")?;
+        if !errors {
             return Ok(0);
         }
         let mut failed = 0;
@@ -108,6 +118,10 @@ impl Elastic {
                 }
             }
         }
+        anyhow::ensure!(
+            failed > 0,
+            "_bulk reported errors without failed items: {value}"
+        );
         Ok(failed)
     }
 

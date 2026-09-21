@@ -29,7 +29,7 @@ layer).
 ## Design notes (vs. the Node.js original)
 
 - **No RabbitMQ** — the reader → processor → bulk-writer stages are
-  in-process Tokio tasks connected by a bounded channel; SHIP's own
+  in-process Tokio tasks connected by bounded channels; SHIP's own
   credit-based flow control provides end-to-end backpressure.
 - **ABI handling** — contract ABIs are tracked in block order from
   state-history `account` deltas (and the system account's `setabi` actions),
@@ -37,6 +37,8 @@ layer).
   block. On a cache miss (indexer started mid-chain) the current ABI is
   fetched from the chain API as a pragmatic fallback. Undecodable action data
   is indexed as `act.hex_data` instead of being dropped.
+  Prepared ABI decoders are reused across actions and rows, and invalidated
+  whenever an on-chain ABI update arrives.
 - **Chain API dialects** — the chain HTTP API (used for `get_info` and the
   ABI fallback) speaks either the classic nodeos REST API (`api = "antelope"`)
   or PulseVM's JSON-RPC 2.0 API
@@ -88,6 +90,65 @@ curl http://localhost:7000/v2/health
 
 Elasticsearch data persists in the `esdata` volume; the API is published on
 port 7000, Elasticsearch on 127.0.0.1:9200.
+
+### Indexing throughput
+
+Use a release build for indexing. Block processing and bulk serialization
+overlap with Elasticsearch writes; up to two serialized batches wait in the
+writer queue. Writes remain sequential to preserve token balances, permission
+updates, and fork replacement order.
+
+Raw block headers, transaction traces, and table deltas are decoded on a
+bounded CPU worker pool. `indexer.decode_workers` controls its concurrency;
+the default is up to two workers, leaving one available CPU for the rest of
+the pipeline. Set it to `0` to decode inline. Completed results are restored
+to SHIP arrival order before ABI updates or document construction, including
+when forks replay earlier block numbers. Running jobs and results waiting for
+an earlier block share the worker limit; another two decoded blocks can wait
+for the processor. Worker errors stop the pipeline. Already running CPU jobs
+may finish after cancellation, but cannot index documents.
+
+`indexer.batch_size` (default 2,000 documents) and `indexer.batch_max_bytes`
+(default 5 MiB) control batch targets. Both are checked after each complete
+block, so a large block can exceed them. Partial batches are queued after
+`flush_interval_ms` (default 500 ms); a busy writer can delay their submission.
+Bulk failures stop the pipeline rather than allowing later batches to advance
+the indexed position. Elasticsearch bulk writes are not atomic: after a partial
+failure, restart with an explicit `start_block` covering the failed batch.
+
+Run the reproducible synthetic pipeline benchmark with:
+
+```bash
+cargo test --release -p hyperion --test e2e benchmark_pipeline -- --ignored --nocapture
+```
+
+It uses local mock SHIP, chain API, and Elasticsearch servers. Its results
+measure processing and simulated write latency, not production Elasticsearch
+capacity. It compares 0, 1, 2, and 4 decoder workers; try the same comparison
+with a representative block sample before raising the worker count.
+
+The initial pipeline optimizations (before parallel raw decoding) were compared
+against `22a377b`, using 4,000 synthetic blocks
+and 80,000 documents (median of three runs):
+
+| Simulated bulk delay | Before | After | Throughput gain |
+|---|---:|---:|---:|
+| 0 ms | 2,633 blocks/s | 3,336 blocks/s | 27% |
+| 10 ms | 2,103 blocks/s | 3,371 blocks/s | 60% |
+
+With parallel raw decoding added, the same workload produced these medians
+over three runs (all numbers are blocks/s):
+
+| Decoder workers | 0 ms bulk delay | 10 ms bulk delay |
+|---|---:|---:|
+| 0 (inline) | 3,579 | 3,621 |
+| 1 | 4,729 | 4,678 |
+| 2 | 4,662 | 4,509 |
+| 4 | 4,705 | 4,693 |
+
+Two workers improved throughput by 25–30% over inline decoding in this run.
+Increasing the worker count did not consistently improve this fixture; ABI
+processing and document construction still run sequentially.
 
 ## API endpoints
 
