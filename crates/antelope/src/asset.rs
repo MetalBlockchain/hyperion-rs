@@ -20,7 +20,11 @@ impl fmt::Display for SymbolCode {
             if c == 0 {
                 break;
             }
-            f.write_str(std::str::from_utf8(&[c]).map_err(|_| fmt::Error)?)?;
+            // Garbage symbol bytes (non-ASCII) occur in real chain data;
+            // render them lossily rather than failing Display (which panics
+            // any caller using to_string()).
+            let ch = if c.is_ascii_graphic() { c as char } else { '?' };
+            write!(f, "{ch}")?;
             v >>= 8;
         }
         Ok(())
@@ -145,6 +149,14 @@ mod tests {
         assert_eq!(Asset::new(-5, sym).to_string(), "-0.0005 EOS");
         let zero: Symbol = "0,SYS".parse().unwrap();
         assert_eq!(Asset::new(42, zero).to_string(), "42 SYS");
+    }
+
+    #[test]
+    fn symbol_code_display_survives_non_ascii_bytes() {
+        // Non-ASCII symbol bytes occur in malformed third-party table rows;
+        // Display used to return fmt::Error, which panics in to_string().
+        let code = SymbolCode(u64::from_le_bytes([b'A', 0xff, b'B', 0, 0, 0, 0, 0]));
+        assert_eq!(code.to_string(), "A?B");
     }
 
     #[test]
