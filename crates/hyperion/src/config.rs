@@ -61,6 +61,12 @@ pub struct IndexerConfig {
     pub flush_interval_ms: u64,
     /// Actions to skip, as `contract::action` (e.g. `eosio::onblock`).
     pub skip_actions: Vec<String>,
+    /// Bulk requests allowed in flight at once. Each document carries an
+    /// external version derived from its block position, so Elasticsearch
+    /// itself rejects a stale write that lands out of order; completions are
+    /// still confirmed in submission order so the resume checkpoint never
+    /// advances past a batch that hasn't landed yet.
+    pub writer_concurrency: usize,
 }
 
 impl Default for IndexerConfig {
@@ -79,6 +85,7 @@ impl Default for IndexerConfig {
             batch_max_bytes: 5 * 1024 * 1024,
             flush_interval_ms: 500,
             skip_actions: Vec::new(),
+            writer_concurrency: 4,
         }
     }
 }
