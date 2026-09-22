@@ -112,9 +112,10 @@ pub async fn run(config: Config) -> Result<()> {
         }
     };
 
-    // Keep writes ordered: concurrent requests could let older token balances,
-    // permission changes, or fork replacements overwrite newer documents.
-    // Two queued batches bound how far processing can run ahead of the writer.
+    // Batches queue ahead of the writer so it's never starved between
+    // flushes; the writer itself may run several bulk requests concurrently
+    // (see write_batches) since each document's external version makes
+    // out-of-order completion safe.
     let (batch_tx, batch_rx) = mpsc::channel(2);
     // JoinSet aborts the remaining stages on error or cancellation, so neither
     // the socket reader nor pending writes can outlive this indexing run.
@@ -130,10 +131,15 @@ pub async fn run(config: Config) -> Result<()> {
     };
     tracing::info!(
         decode_workers = config.indexer.decode_workers,
+        writer_concurrency = config.indexer.writer_concurrency,
         "started indexing pipeline"
     );
+    let progress_index = config.index("progress");
+    let writer_concurrency = config.indexer.writer_concurrency;
     stages.spawn(async move { process_blocks(&config, input, batch_tx).await });
-    stages.spawn(async move { write_batches(&es, batch_rx).await });
+    stages.spawn(
+        async move { write_batches(&es, batch_rx, writer_concurrency, &progress_index).await },
+    );
     while let Some(result) = stages.join_next().await {
         result??;
     }
@@ -253,8 +259,13 @@ async fn process_blocks(
             last_block = this_block.block_num;
         }
 
-        for doc in processor.process_decoded(&block, &mut abis).await? {
-            batch.push(&indices[doc.kind], &doc)?;
+        let docs = processor.process_decoded(&block, &mut abis).await?;
+        for (seq, doc) in docs.into_iter().enumerate() {
+            // High bits = block, low bits = position within the block: always
+            // increases across blocks, and disambiguates multiple updates to
+            // the same entity (e.g. a permission touched twice) within one.
+            let version = (u64::from(last_block) << 32) | seq as u64;
+            batch.push(&indices[doc.kind], &doc, version)?;
         }
         blocks_since_report += 1;
 
@@ -284,8 +295,22 @@ async fn resolve_start_block(config: &Config, es: &Elastic) -> Result<u32> {
     if config.indexer.start_block > 0 {
         return Ok(config.indexer.start_block);
     }
-    // Resume after the highest indexed block; block index first, actions as
-    // fallback for deployments that disable fetch_block.
+    // The checkpoint only advances once batches complete contiguously (see
+    // write_batches), so it's safe to trust even though writes themselves
+    // may complete out of order. Prefer it over the raw aggregation below,
+    // which can't tell "durably confirmed" apart from "visible but a lower
+    // block is still in flight or failed".
+    if let Some(checkpoint) = es.get_checkpoint(&config.index("progress")).await? {
+        tracing::info!(
+            resume_from = checkpoint + 1,
+            index = "progress",
+            "resuming from last confirmed checkpoint"
+        );
+        return Ok(checkpoint + 1);
+    }
+    // Deployments predating the checkpoint doc: fall back to the highest
+    // indexed block; block index first, actions as fallback for deployments
+    // that disable fetch_block.
     for kind in ["block", "action"] {
         if let Some(max) = es.max_block_num(&config.index(kind)).await? {
             tracing::info!(
@@ -303,6 +328,9 @@ async fn resolve_start_block(config: &Config, es: &Elastic) -> Result<u32> {
 struct BulkBatch {
     body: Vec<u8>,
     count: usize,
+    /// Highest block any document in this batch belongs to, so the writer
+    /// can advance the resume checkpoint once the batch is durably written.
+    max_block: u32,
 }
 
 #[derive(Serialize)]
@@ -311,13 +339,22 @@ struct BulkMetadata<'a> {
     index: &'a str,
     #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
     id: Option<&'a str>,
+    version_type: &'static str,
+    version: u64,
 }
 
 impl BulkBatch {
-    fn push(&mut self, index: &str, doc: &Doc) -> Result<()> {
+    /// `version`'s high 32 bits are the document's block number (see the
+    /// call site in `process_blocks`), used both as Elasticsearch's external
+    /// version — so a write that arrives out of order is rejected rather
+    /// than silently overwriting a newer document — and to track how far
+    /// this batch's content reaches for the resume checkpoint.
+    fn push(&mut self, index: &str, doc: &Doc, version: u64) -> Result<()> {
         let meta = BulkMetadata {
             index,
             id: doc.id.as_deref(),
+            version_type: "external",
+            version,
         };
         match doc.op {
             Op::Index => {
@@ -335,30 +372,84 @@ impl BulkBatch {
             }
         }
         self.count += 1;
+        self.max_block = self.max_block.max((version >> 32) as u32);
         Ok(())
     }
 }
 
-async fn write_batches(es: &Elastic, mut rx: mpsc::Receiver<BulkBatch>) -> Result<()> {
-    while let Some(batch) = rx.recv().await {
-        let count = batch.count;
-        let bytes = batch.body.len();
-        let started = Instant::now();
-        let failed = es.bulk(batch.body).await?;
-        // Do not submit newer batches after a failed write: doing so would
-        // advance the resume position past documents that were never indexed.
-        anyhow::ensure!(
-            failed == 0,
-            "bulk indexing failed for {failed} of {count} documents"
-        );
-        tracing::debug!(
-            count,
-            bytes,
-            elapsed_ms = started.elapsed().as_millis(),
-            "flushed batch"
-        );
+/// Runs up to `concurrency` bulk requests at once. Each document's external
+/// version (`BulkBatch::push`) makes out-of-order completion safe at the
+/// Elasticsearch level, but batches are still confirmed in submission order
+/// here so `progress_index`'s checkpoint never advances past one that's
+/// still in flight or that failed — even though a later batch may already
+/// have landed on the wire by the time an earlier one is confirmed.
+async fn write_batches(
+    es: &Elastic,
+    mut rx: mpsc::Receiver<BulkBatch>,
+    concurrency: usize,
+    progress_index: &str,
+) -> Result<()> {
+    anyhow::ensure!(concurrency > 0, "writer_concurrency must be at least 1");
+    let mut jobs = tokio::task::JoinSet::new();
+    let mut ready: BTreeMap<u64, (u32, Result<()>)> = BTreeMap::new();
+    let mut submitted = 0u64;
+    let mut completed = 0u64;
+    let mut checkpoint = 0u32;
+    let mut closed = false;
+    loop {
+        if let Some((max_block, result)) = ready.remove(&completed) {
+            result?;
+            completed += 1;
+            if max_block > checkpoint {
+                checkpoint = max_block;
+                es.set_checkpoint(progress_index, checkpoint).await?;
+            }
+            continue;
+        }
+        if closed && jobs.is_empty() {
+            return Ok(());
+        }
+        tokio::select! {
+            batch = rx.recv(), if !closed && jobs.len() + ready.len() < concurrency => {
+                match batch {
+                    Some(batch) => {
+                        let ordinal = submitted;
+                        submitted += 1;
+                        let max_block = batch.max_block;
+                        let count = batch.count;
+                        let bytes = batch.body.len();
+                        let es = es.clone();
+                        jobs.spawn(async move {
+                            let started = Instant::now();
+                            let result = es.bulk(batch.body).await.and_then(|failed| {
+                                anyhow::ensure!(
+                                    failed == 0,
+                                    "bulk indexing failed for {failed} of {count} documents"
+                                );
+                                Ok(())
+                            });
+                            if result.is_ok() {
+                                tracing::debug!(
+                                    count,
+                                    bytes,
+                                    elapsed_ms = started.elapsed().as_millis(),
+                                    "flushed batch"
+                                );
+                            }
+                            (ordinal, max_block, result)
+                        });
+                    }
+                    None => closed = true,
+                }
+            }
+            result = jobs.join_next(), if !jobs.is_empty() => {
+                let (ordinal, max_block, result) = result
+                    .expect("nonempty writer jobs")
+                    .context("bulk writer task failed")?;
+                ready.insert(ordinal, (max_block, result));
+            }
+        }
     }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -548,20 +639,96 @@ mod tests {
         let mut servers = tokio::task::JoinSet::new();
         servers.spawn(async move { axum::serve(listener, app).await.unwrap() });
         let (tx, rx) = mpsc::channel(2);
-        for _ in 0..2 {
+        for i in 0..2 {
             tx.send(BulkBatch {
                 count: 1,
                 body: b"{}\n".to_vec(),
+                max_block: i + 1,
             })
             .await
             .unwrap();
         }
         drop(tx);
-        let error = write_batches(&Elastic::new(&config.elasticsearch), rx)
-            .await
-            .unwrap_err();
+        // concurrency = 1 reproduces the old fully-serial writer: the second
+        // batch must never even be submitted once the first has failed.
+        let error = write_batches(
+            &Elastic::new(&config.elasticsearch),
+            rx,
+            1,
+            "unused-progress",
+        )
+        .await
+        .unwrap_err();
         assert!(error.to_string().contains("bulk indexing failed"));
         assert_eq!(requests.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn checkpoint_never_advances_past_a_failed_batch_even_if_a_later_one_lands_first() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        let checkpoint_puts = Arc::new(AtomicUsize::new(0));
+        let puts = checkpoint_puts.clone();
+        let app = axum::Router::new()
+            .route(
+                "/_bulk",
+                axum::routing::post(|body: axum::body::Bytes| async move {
+                    if body.starts_with(b"fail") {
+                        axum::Json(json!({"errors": true, "items": [
+                            {"index": {"status": 429, "error": {"type": "rejected"}}}
+                        ]}))
+                    } else {
+                        axum::Json(json!({"errors": false}))
+                    }
+                }),
+            )
+            .route(
+                "/progress-index/_doc/checkpoint",
+                axum::routing::put(move || {
+                    puts.fetch_add(1, Ordering::SeqCst);
+                    async { axum::Json(json!({"result": "updated"})) }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = config();
+        config.elasticsearch.url = format!("http://{}", listener.local_addr().unwrap());
+        let mut servers = tokio::task::JoinSet::new();
+        servers.spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let (tx, rx) = mpsc::channel(2);
+        // Ordinal 0 fails, ordinal 1 (a later block) would succeed on its
+        // own — with concurrency > 1 both are in flight before either
+        // completes, so ordinal 1 may well land on the wire first.
+        tx.send(BulkBatch {
+            count: 1,
+            body: b"fail\n".to_vec(),
+            max_block: 1,
+        })
+        .await
+        .unwrap();
+        tx.send(BulkBatch {
+            count: 1,
+            body: b"ok\n".to_vec(),
+            max_block: 2,
+        })
+        .await
+        .unwrap();
+        drop(tx);
+        let error = write_batches(
+            &Elastic::new(&config.elasticsearch),
+            rx,
+            4,
+            "progress-index",
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("bulk indexing failed"));
+        assert_eq!(
+            checkpoint_puts.load(Ordering::SeqCst),
+            0,
+            "checkpoint must not advance while an earlier batch is unresolved or failed"
+        );
     }
 
     #[test]
@@ -573,13 +740,14 @@ mod tests {
             body: json!({"memo": "line one\nline two", "value": 42}),
             op: Op::Index,
         };
-        batch.push("test-action", &doc).unwrap();
+        batch.push("test-action", &doc, 7).unwrap();
         doc.id = None;
-        batch.push("test-action", &doc).unwrap();
+        batch.push("test-action", &doc, 7).unwrap();
         doc.op = Op::Delete;
         doc.id = Some("balance".into());
-        batch.push("test-token", &doc).unwrap();
+        batch.push("test-token", &doc, (2u64 << 32) | 1).unwrap();
         assert_eq!(batch.count, 3);
+        assert_eq!(batch.max_block, 2);
         assert!(batch.body.ends_with(b"\n"));
         let body = String::from_utf8(batch.body).unwrap();
         let lines: Vec<Value> = body
@@ -589,11 +757,20 @@ mod tests {
         assert_eq!(
             lines,
             vec![
-                json!({"index": {"_index": "test-action", "_id": "quoted\"id\n"}}),
+                json!({
+                    "index": {"_index": "test-action", "_id": "quoted\"id\n",
+                              "version_type": "external", "version": 7}
+                }),
                 doc.body.clone(),
-                json!({"index": {"_index": "test-action"}}),
+                json!({
+                    "index": {"_index": "test-action",
+                              "version_type": "external", "version": 7}
+                }),
                 doc.body,
-                json!({"delete": {"_index": "test-token", "_id": "balance"}}),
+                json!({
+                    "delete": {"_index": "test-token", "_id": "balance",
+                               "version_type": "external", "version": (2u64 << 32) | 1}
+                }),
             ]
         );
     }

@@ -392,6 +392,7 @@ struct PipelineOptions {
     bulk_delay_ms: u64,
     fail_bulk: bool,
     decode_workers: usize,
+    writer_concurrency: usize,
 }
 
 impl Default for PipelineOptions {
@@ -404,6 +405,7 @@ impl Default for PipelineOptions {
             bulk_delay_ms: 0,
             fail_bulk: false,
             decode_workers: 2,
+            writer_concurrency: 4,
         }
     }
 }
@@ -440,6 +442,7 @@ async fn run_pipeline_options(
     let batch_size = options.batch_size;
     let batch_max_bytes = options.batch_max_bytes;
     let decode_workers = options.decode_workers;
+    let writer_concurrency = options.writer_concurrency;
 
     let config: Config = toml::from_str(&format!(
         r#"
@@ -455,6 +458,7 @@ async fn run_pipeline_options(
         batch_size = {batch_size}
         batch_max_bytes = {batch_max_bytes}
         decode_workers = {decode_workers}
+        writer_concurrency = {writer_concurrency}
 
         [elasticsearch]
         url = "http://{es_addr}"
@@ -567,8 +571,8 @@ async fn propagates_bulk_item_failures() {
 #[ignore = "synthetic throughput benchmark; run explicitly in release mode"]
 async fn benchmark_pipeline() {
     let blocks = 4000;
-    for workers in [0, 1, 2, 4] {
-        for delay in [0, 10] {
+    for writer_concurrency in [1, 4, 8] {
+        for delay in [0, 10, 50, 100] {
             let start = std::time::Instant::now();
             let docs = run_pipeline_options(
                 "antelope",
@@ -576,7 +580,8 @@ async fn benchmark_pipeline() {
                     blocks,
                     transactions: 16,
                     bulk_delay_ms: delay,
-                    decode_workers: workers,
+                    decode_workers: 2,
+                    writer_concurrency,
                     ..Default::default()
                 },
             )
@@ -585,7 +590,7 @@ async fn benchmark_pipeline() {
             let elapsed = start.elapsed();
             assert_eq!(docs.len(), blocks as usize * 20);
             eprintln!(
-            "decode_workers={workers}, bulk_delay_ms={delay}: {blocks} blocks, {} docs in {:.3}s ({:.0} blocks/s)",
+            "writer_concurrency={writer_concurrency}, bulk_delay_ms={delay}: {blocks} blocks, {} docs in {:.3}s ({:.0} blocks/s)",
             docs.len(),
             elapsed.as_secs_f64(),
             blocks as f64 / elapsed.as_secs_f64()

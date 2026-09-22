@@ -79,6 +79,13 @@ impl Elastic {
     }
 
     /// Submit an NDJSON `_bulk` body. Returns the number of failed items.
+    ///
+    /// A `409` (external version conflict) is not a failure: every document
+    /// carries a version derived from its block position, so a conflict
+    /// means Elasticsearch correctly rejected a write that was stale or a
+    /// duplicate of one already applied (e.g. re-processing a block on
+    /// resume). Counting those as failures would abort the indexer on
+    /// perfectly ordinary resume traffic.
     pub async fn bulk(&self, body: impl Into<reqwest::Body>) -> Result<usize> {
         let res = self
             .request(
@@ -111,18 +118,56 @@ impl Elastic {
                 let op = item.as_object().and_then(|o| o.values().next());
                 if let Some(op) = op {
                     let code = op["status"].as_u64().unwrap_or(0);
-                    if code >= 300 {
+                    if code == 409 {
+                        tracing::debug!(error = %op["error"], "bulk item superseded (stale version)");
+                    } else if code >= 300 {
                         failed += 1;
                         tracing::warn!(error = %op["error"], "bulk item failed");
                     }
                 }
             }
         }
-        anyhow::ensure!(
-            failed > 0,
-            "_bulk reported errors without failed items: {value}"
-        );
+        // `errors: true` with `failed == 0` is expected when every flagged
+        // item was a 409 (superseded write) rather than a real failure.
         Ok(failed)
+    }
+
+    /// Highest block confirmed durably written, in submission order, if any.
+    /// Preferred over `max_block_num` once writes can complete out of order.
+    pub async fn get_checkpoint(&self, index: &str) -> Result<Option<u32>> {
+        if !self.index_exists(index).await? {
+            return Ok(None);
+        }
+        let res = self
+            .request(reqwest::Method::GET, &format!("/{index}/_doc/checkpoint"))
+            .send()
+            .await
+            .context("elasticsearch checkpoint GET")?;
+        if res.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let status = res.status();
+        let value: Value = res.json().await.unwrap_or(Value::Null);
+        if !status.is_success() {
+            return Err(anyhow!(
+                "elasticsearch checkpoint GET failed ({status}): {value}"
+            ));
+        }
+        if !value["found"].as_bool().unwrap_or(false) {
+            return Ok(None);
+        }
+        Ok(value["_source"]["block_num"].as_u64().map(|v| v as u32))
+    }
+
+    /// Persist the highest block confirmed durably written so far.
+    pub async fn set_checkpoint(&self, index: &str, block_num: u32) -> Result<()> {
+        self.json(
+            reqwest::Method::PUT,
+            &format!("/{index}/_doc/checkpoint"),
+            Some(json!({"block_num": block_num})),
+        )
+        .await?;
+        Ok(())
     }
 
     pub async fn search(&self, index: &str, body: Value) -> Result<Value> {
@@ -276,6 +321,17 @@ pub fn index_definitions(shards: u32, replicas: u32) -> Vec<(&'static str, Value
                     "symbol": {"type": "keyword"},
                     "precision": {"type": "integer"},
                     "amount": {"type": "double"},
+                }}
+            }),
+        ),
+        (
+            // Single `checkpoint` doc: the highest block confirmed durably
+            // written in submission order. See `get_checkpoint`/`set_checkpoint`.
+            "progress",
+            json!({
+                "settings": settings,
+                "mappings": {"properties": {
+                    "block_num": {"type": "long"},
                 }}
             }),
         ),
