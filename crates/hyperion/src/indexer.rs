@@ -377,6 +377,64 @@ impl BulkBatch {
     }
 }
 
+/// Elasticsearch rejects request bodies above `http.max_content_length`
+/// (100 MB by default) with 413. `batch_max_bytes` is only checked between
+/// complete blocks, so a single very large block -- a snapshot-import boot
+/// emits the entire imported chain state as one block's deltas -- still
+/// produces an oversized batch. Such batches are split at entry boundaries
+/// before submission.
+const MAX_BULK_REQUEST_BYTES: usize = 48 * 1024 * 1024;
+
+/// Split an NDJSON `_bulk` body into request-sized ranges of at most `max`
+/// bytes without separating an action line from its document line. A single
+/// entry larger than `max` is sent on its own.
+fn split_bulk_body(body: &[u8], max: usize) -> Vec<std::ops::Range<usize>> {
+    fn line_end(body: &[u8], from: usize) -> usize {
+        body[from..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .map_or(body.len(), |i| from + i + 1)
+    }
+    let mut ranges = Vec::new();
+    let mut start = 0;
+    let mut pos = 0;
+    while pos < body.len() {
+        let action_end = line_end(body, pos);
+        // `delete` is a bare action line; every other action carries a
+        // document on the following line.
+        let entry_end = if body[pos..].starts_with(b"{\"delete\":") {
+            action_end
+        } else {
+            line_end(body, action_end)
+        };
+        if pos > start && entry_end - start > max {
+            ranges.push(start..pos);
+            start = pos;
+        }
+        pos = entry_end;
+    }
+    if start < body.len() {
+        ranges.push(start..body.len());
+    }
+    ranges
+}
+
+/// Submit a batch as one `_bulk` request, or as several when it exceeds
+/// `max` bytes. Returns the number of failed items; stops at the first chunk
+/// with failures so the batch is never confirmed past them.
+async fn bulk_in_chunks(es: &Elastic, body: &[u8], max: usize) -> Result<usize> {
+    if body.len() <= max {
+        return es.bulk(body.to_vec()).await;
+    }
+    for range in split_bulk_body(body, max) {
+        let failed = es.bulk(body[range].to_vec()).await?;
+        if failed > 0 {
+            return Ok(failed);
+        }
+    }
+    Ok(0)
+}
+
 /// Runs up to `concurrency` bulk requests at once. Each document's external
 /// version (`BulkBatch::push`) makes out-of-order completion safe at the
 /// Elasticsearch level, but batches are still confirmed in submission order
@@ -421,7 +479,9 @@ async fn write_batches(
                         let es = es.clone();
                         jobs.spawn(async move {
                             let started = Instant::now();
-                            let result = es.bulk(batch.body).await.and_then(|failed| {
+                            let result = bulk_in_chunks(&es, &batch.body, MAX_BULK_REQUEST_BYTES)
+                                .await
+                                .and_then(|failed| {
                                 anyhow::ensure!(
                                     failed == 0,
                                     "bulk indexing failed for {failed} of {count} documents"
@@ -456,6 +516,110 @@ async fn write_batches(
 mod tests {
     use super::*;
     use serde_json::{json, Value};
+
+    #[test]
+    fn split_bulk_body_keeps_action_and_document_together() {
+        let entry = |i: usize| format!("{{\"index\":{{\"_id\":\"{i}\"}}}}\n{{\"n\":{i}}}\n");
+        let body: Vec<u8> = (0..4).map(entry).collect::<String>().into_bytes();
+        let one = entry(0).len();
+        assert_eq!(split_bulk_body(&body, body.len()), vec![0..body.len()]);
+        let ranges = split_bulk_body(&body, one * 2 + one / 2);
+        assert_eq!(ranges, vec![0..one * 2, one * 2..one * 4]);
+        // An entry larger than the limit is still sent whole, on its own.
+        let ranges = split_bulk_body(&body, one / 2);
+        assert_eq!(ranges.len(), 4);
+        assert!(ranges.iter().all(|r| r.len() == one));
+        assert!(split_bulk_body(b"", 10).is_empty());
+    }
+
+    #[test]
+    fn split_bulk_body_treats_delete_as_single_line() {
+        let body = b"{\"delete\":{\"_id\":\"a\"}}\n{\"index\":{}}\n{\"n\":1}\n{\"delete\":{\"_id\":\"b\"}}\n";
+        let chunks: Vec<&[u8]> = split_bulk_body(body, 24)
+            .into_iter()
+            .map(|r| &body[r])
+            .collect();
+        assert_eq!(
+            chunks,
+            vec![
+                &b"{\"delete\":{\"_id\":\"a\"}}\n"[..],
+                &b"{\"index\":{}}\n{\"n\":1}\n"[..],
+                &b"{\"delete\":{\"_id\":\"b\"}}\n"[..],
+            ]
+        );
+    }
+
+    /// Drives the real `_bulk` path against a mock Elasticsearch: an
+    /// oversized batch built by `BulkBatch::push` must arrive as several
+    /// requests, each under the limit, each valid NDJSON (every action line
+    /// followed by its document), together carrying every byte in order.
+    #[tokio::test]
+    async fn oversized_batch_is_sent_as_valid_ndjson_chunks() {
+        use std::sync::{Arc, Mutex};
+        let bodies = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+        let seen = bodies.clone();
+        let app = axum::Router::new().route(
+            "/_bulk",
+            axum::routing::post(move |body: axum::body::Bytes| {
+                seen.lock().unwrap().push(body.to_vec());
+                async { axum::Json(json!({"errors": false, "items": []})) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = config();
+        config.elasticsearch.url = format!("http://{}", listener.local_addr().unwrap());
+        let mut servers = tokio::task::JoinSet::new();
+        servers.spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let mut batch = BulkBatch::default();
+        for i in 0..200u64 {
+            let doc = Doc {
+                kind: "delta",
+                op: if i % 7 == 0 { Op::Delete } else { Op::Index },
+                id: Some(format!("row-{i}")),
+                body: json!({"n": i, "pad": "x".repeat(64)}),
+            };
+            batch.push("deltas", &doc, (1u64 << 32) | i).unwrap();
+        }
+        let es = Elastic::new(&config.elasticsearch);
+        let max = 1024;
+        assert_eq!(bulk_in_chunks(&es, &batch.body, max).await.unwrap(), 0);
+
+        let bodies = bodies.lock().unwrap().clone();
+        assert!(bodies.len() > 1, "expected the batch to be split");
+        assert_eq!(
+            bodies.concat(),
+            batch.body,
+            "chunks must reassemble the batch"
+        );
+        let mut docs = 0;
+        for body in bodies.iter() {
+            assert!(body.len() <= max);
+            let lines: Vec<Value> = body
+                .split(|&b| b == b'\n')
+                .filter(|l| !l.is_empty())
+                .map(|l| serde_json::from_slice(l).unwrap())
+                .collect();
+            let mut i = 0;
+            while i < lines.len() {
+                if lines[i].get("delete").is_some() {
+                    i += 1;
+                } else {
+                    assert!(lines[i].get("index").is_some(), "chunk starts mid-entry");
+                    assert!(
+                        lines[i + 1].get("n").is_some(),
+                        "document split from action"
+                    );
+                    i += 2;
+                }
+                docs += 1;
+            }
+        }
+        assert_eq!(docs, 200);
+        // A batch under the limit stays a single request.
+        let small = &batch.body[..split_bulk_body(&batch.body, max)[0].end];
+        bulk_in_chunks(&es, small, max).await.unwrap();
+    }
 
     fn block(number: u32) -> Box<GetBlocksResult> {
         // Empty signed block: fixed header, no producer schedule or header
