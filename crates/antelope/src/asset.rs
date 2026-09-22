@@ -106,13 +106,20 @@ impl fmt::Display for Asset {
         let negative = self.amount < 0;
         let abs = self.amount.unsigned_abs();
         let sign = if negative { "-" } else { "" };
+        // `precision` comes straight off the wire (the low byte of a
+        // packed symbol) with no range check applied anywhere upstream.
+        // A corrupt or out-of-range value must not be able to
+        // overflow-wrap `10u64.pow` into a zero divisor and panic here.
         if precision == 0 {
-            write!(f, "{sign}{abs} {}", self.symbol.code())
-        } else {
-            let divisor = 10u64.pow(precision as u32);
-            let int = abs / divisor;
-            let frac = abs % divisor;
-            write!(f, "{sign}{int}.{frac:0precision$} {}", self.symbol.code())
+            return write!(f, "{sign}{abs} {}", self.symbol.code());
+        }
+        match 10u64.checked_pow(precision as u32) {
+            Some(divisor) => {
+                let int = abs / divisor;
+                let frac = abs % divisor;
+                write!(f, "{sign}{int}.{frac:0precision$} {}", self.symbol.code())
+            }
+            None => write!(f, "{sign}{abs} {}", self.symbol.code()),
         }
     }
 }
@@ -138,5 +145,16 @@ mod tests {
         assert_eq!(Asset::new(-5, sym).to_string(), "-0.0005 EOS");
         let zero: Symbol = "0,SYS".parse().unwrap();
         assert_eq!(Asset::new(42, zero).to_string(), "42 SYS");
+    }
+
+    #[test]
+    fn asset_display_survives_corrupt_precision() {
+        // A precision byte this large can only come from malformed/corrupt
+        // data (real Antelope precisions are 0-18). 10u64.pow(250) would
+        // overflow-wrap to 0 in a release build and panic on the division
+        // below; Display must degrade gracefully instead of crashing the
+        // indexer on untrusted chain data.
+        let sym: Symbol = "250,BAD".parse().unwrap();
+        assert_eq!(Asset::new(42, sym).to_string(), "42 BAD");
     }
 }
