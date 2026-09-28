@@ -394,7 +394,10 @@ async fn write_batches(
     let mut ready: BTreeMap<u64, (u32, Result<()>)> = BTreeMap::new();
     let mut submitted = 0u64;
     let mut completed = 0u64;
-    let mut checkpoint = 0u32;
+    // Seed the in-memory watermark from Elasticsearch. This prevents a
+    // manually configured older start block, or a restart during recovery,
+    // from moving the durable checkpoint backwards.
+    let mut checkpoint = es.get_checkpoint(progress_index).await?.unwrap_or(0);
     let mut closed = false;
     loop {
         if let Some((max_block, result)) = ready.remove(&completed) {
@@ -661,6 +664,46 @@ mod tests {
         .unwrap_err();
         assert!(error.to_string().contains("bulk indexing failed"));
         assert_eq!(requests.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn writer_accepts_already_absent_delete_document() {
+        let app = axum::Router::new()
+            .route(
+                "/_bulk",
+                axum::routing::post(|| async {
+                    axum::Json(json!({
+                        "errors": true,
+                        "items": [{"delete": {"status": 404}}]
+                    }))
+                }),
+            )
+            .route(
+                "/unused-progress/_doc/checkpoint",
+                axum::routing::put(|| async { axum::Json(json!({"result": "updated"})) }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = config();
+        config.elasticsearch.url = format!("http://{}", listener.local_addr().unwrap());
+        let mut servers = tokio::task::JoinSet::new();
+        servers.spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let (tx, rx) = mpsc::channel(1);
+        tx.send(BulkBatch {
+            count: 1,
+            body: b"{\"delete\":{}}\n".to_vec(),
+            max_block: 42,
+        })
+        .await
+        .unwrap();
+        drop(tx);
+        write_batches(
+            &Elastic::new(&config.elasticsearch),
+            rx,
+            1,
+            "unused-progress",
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
