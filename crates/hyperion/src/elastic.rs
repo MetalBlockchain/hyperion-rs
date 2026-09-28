@@ -115,15 +115,19 @@ impl Elastic {
         let mut failed = 0;
         if let Some(items) = value["items"].as_array() {
             for item in items {
-                let op = item.as_object().and_then(|o| o.values().next());
-                if let Some(op) = op {
-                    let code = op["status"].as_u64().unwrap_or(0);
-                    if code == 409 {
-                        tracing::debug!(error = %op["error"], "bulk item superseded (stale version)");
-                    } else if code >= 300 {
-                        failed += 1;
-                        tracing::warn!(error = %op["error"], "bulk item failed");
-                    }
+                let Some((operation, op)) =
+                    item.as_object().and_then(|object| object.iter().next())
+                else {
+                    continue;
+                };
+                let code = op["status"].as_u64().unwrap_or(0);
+                if code == 409 {
+                    tracing::debug!(error = %op["error"], "bulk item superseded (stale version)");
+                } else if code == 404 && operation == "delete" {
+                    tracing::debug!(status = code, "bulk delete target already absent");
+                } else if code >= 300 {
+                    failed += 1;
+                    tracing::warn!(error = %op["error"], "bulk item failed");
                 }
             }
         }
