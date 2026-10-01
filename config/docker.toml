@@ -23,12 +23,8 @@ batch_size = 2000
 flush_interval_ms = 500
 skip_actions = []
 
-[elasticsearch]
-url = "http://elasticsearch:9200"
-user = ""
-pass = ""
-shards = 1
-replicas = 0
+[clickhouse]
+url = "http://clickhouse:8123"
 
 [api]
 # Must bind 0.0.0.0 inside the container so the published port works.

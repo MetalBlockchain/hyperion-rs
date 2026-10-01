@@ -1,161 +1,29 @@
-//! ClickHouse table schemas and serialization types for Hyperion.
+//! ClickHouse table schemas for Hyperion.
 //!
-//! All tables use ReplacingMergeTree with version column for replay idempotence.
-//! Version is computed as: (block_num << 32) | position_in_block
-
-use serde::{Serialize, Deserialize};
-
-
-/// Action document: one per action, inline notifications collapsed to notified array.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Action {
-    #[serde(rename = "block_num")]
-    pub block_num: u32,
-    #[serde(rename = "global_sequence")]
-    pub global_sequence: u64,
-    #[serde(rename = "@timestamp")]
-    pub timestamp: String,
-    pub block_id: String,
-    pub trx_id: String,
-    pub producer: String,
-    #[serde(rename = "act.account")]
-    pub act_account: String,
-    #[serde(rename = "act.name")]
-    pub act_name: String,
-    #[serde(rename = "act.authorization")]
-    pub act_authorization: Vec<Authorization>,
-    #[serde(rename = "act.data")]
-    pub act_data: serde_json::Value,
-    #[serde(rename = "act.hex_data")]
-    pub act_hex_data: Option<String>,
-
-    // Extracted transfer fields
-    #[serde(rename = "@transfer.from", skip_serializing_if = "Option::is_none")]
-    pub transfer_from: Option<String>,
-    #[serde(rename = "@transfer.to", skip_serializing_if = "Option::is_none")]
-    pub transfer_to: Option<String>,
-    #[serde(rename = "@transfer.amount", skip_serializing_if = "Option::is_none")]
-    pub transfer_amount: Option<f64>,
-    #[serde(rename = "@transfer.symbol", skip_serializing_if = "Option::is_none")]
-    pub transfer_symbol: Option<String>,
-    #[serde(rename = "@transfer.memo", skip_serializing_if = "Option::is_none")]
-    pub transfer_memo: Option<String>,
-
-    pub notified: Vec<String>,
-    pub receipts: Vec<Receipt>,
-    pub cpu_usage_us: u32,
-    pub net_usage_words: u32,
-    pub action_ordinal: u32,
-    pub creator_action_ordinal: u32,
-    pub signatures: Vec<String>,
-
-    #[serde(skip)]
-    pub version: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Authorization {
-    pub actor: String,
-    pub permission: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Receipt {
-    pub receiver: String,
-    pub global_sequence: u64,
-}
-
-/// Block document: one per block.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Block {
-    pub block_num: u32,
-    #[serde(rename = "@timestamp")]
-    pub timestamp: String,
-    pub block_id: String,
-    pub prev_id: String,
-    pub producer: String,
-    pub schedule_version: u32,
-    pub trx_count: u32,
-    pub cpu_usage_us: u64,
-    pub net_usage_words: u64,
-
-    #[serde(skip)]
-    pub version: u64,
-}
-
-/// Delta document: one per table delta.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Delta {
-    pub block_num: u32,
-    #[serde(rename = "@timestamp")]
-    pub timestamp: String,
-    pub block_id: String,
-    pub code: String,
-    pub scope: String,
-    pub table: String,
-    pub primary_key: String,
-    pub payer: String,
-    pub present: bool,
-    pub data: serde_json::Value,
-    pub value_hex: Option<String>,
-
-    #[serde(skip)]
-    pub version: u64,
-}
-
-/// ABI document: one per contract ABI change.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Abi {
-    pub block_num: u32,
-    #[serde(rename = "@timestamp")]
-    pub timestamp: String,
-    pub account: String,
-    pub abi: String,
-    pub actions: Vec<String>,
-    pub tables: Vec<String>,
-
-    #[serde(skip)]
-    pub version: u64,
-}
-
-/// Permission document: snapshot table, one per unique (owner, name).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Permission {
-    pub block_num: u32,
-    pub owner: String,
-    pub name: String,
-    pub parent: String,
-    pub last_updated: String,
-    pub keys: Vec<String>,
-    pub accounts: Vec<String>,
-    pub threshold: u32,
-
-    #[serde(skip)]
-    pub version: u64,
-}
-
-/// Token document: snapshot table, one per unique (code, scope, symbol).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Token {
-    pub block_num: u32,
-    pub code: String,
-    pub scope: String,
-    pub symbol: String,
-    pub precision: u8,
-    pub amount: f64,
-
-    #[serde(skip)]
-    pub version: u64,
-}
-
-/// Progress checkpoint document.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Progress {
-    pub block_num: u32,
-
-    #[serde(skip)]
-    pub version: u64,
-}
+//! All tables use ReplacingMergeTree with a version column for replay
+//! idempotence. For the two append-only history tables (`action`, `delta`,
+//! `block`, `abi`) version is `(block_num << 32) | position_in_block` and the
+//! sort key includes `block_num`, so every block's rows are kept. For the two
+//! current-state snapshot tables (`perm`, `token`) the sort key deliberately
+//! excludes `block_num` - see the comment on the `perm` table below.
+//!
+//! `writer::doc_to_row` builds rows in exactly the column order declared
+//! here; there is no explicit column list on the `INSERT ... FORMAT
+//! TabSeparated` calls, so the two must stay in lockstep.
+//!
+//! `timestamp`/`last_updated` are `DateTime64(3)`, not `DateTime`: the
+//! processor's own timestamp strings are millisecond-precision ISO-8601
+//! (`2000-01-01T00:08:20.000`, no trailing `Z`), and `DateTime` - confirmed
+//! against a real server - fails to parse the fractional part at all
+//! ("garbage after DateTime"), not just silently truncating it.
+//!
+//! None of the `ORDER BY` clauses below use `DESC`: a MergeTree-family
+//! table's `ORDER BY` is a physical sort/sparse-index key, not a query
+//! result order, and this ClickHouse version rejects a direction modifier
+//! there outright (confirmed against a real server: `DESC` in a table's
+//! `ORDER BY` is a `SYNTAX_ERROR`, not just a style choice). Query-time
+//! ordering is independent and already handled by `clickhouse::queries`'
+//! own `ORDER BY ... DESC` in each `SELECT`.
 
 /// SQL DDL for creating all ClickHouse tables.
 pub fn create_tables_sql() -> &'static str {
@@ -164,7 +32,7 @@ pub fn create_tables_sql() -> &'static str {
 CREATE TABLE IF NOT EXISTS action (
     block_num UInt32,
     global_sequence UInt64,
-    timestamp DateTime,
+    timestamp DateTime64(3),
     block_id String,
     trx_id String,
     producer String,
@@ -179,6 +47,9 @@ CREATE TABLE IF NOT EXISTS action (
     transfer_amount Nullable(Float64),
     transfer_symbol Nullable(String),
     transfer_memo Nullable(String),
+
+    newaccount_creator Nullable(String),
+    newaccount_newact Nullable(String),
 
     notified Array(String),
     receipts Array(Tuple(receiver String, global_sequence UInt64)),
@@ -195,13 +66,13 @@ CREATE TABLE IF NOT EXISTS action (
     INDEX idx_trx_id trx_id TYPE bloom_filter()
 ) ENGINE = ReplacingMergeTree(version)
 PARTITION BY (block_num DIV 10000)
-ORDER BY (notified, block_num DESC, global_sequence DESC)
+ORDER BY (notified, block_num, global_sequence)
 SETTINGS index_granularity = 8192;
 
 -- Blocks table
 CREATE TABLE IF NOT EXISTS block (
     block_num UInt32,
-    timestamp DateTime,
+    timestamp DateTime64(3),
     block_id String,
     prev_id String,
     producer String,
@@ -214,20 +85,20 @@ CREATE TABLE IF NOT EXISTS block (
     INDEX idx_producer producer TYPE set(1000)
 ) ENGINE = ReplacingMergeTree(version)
 PARTITION BY (block_num DIV 100000)
-ORDER BY (block_num DESC)
+ORDER BY (block_num)
 SETTINGS index_granularity = 8192;
 
 -- Deltas table
 CREATE TABLE IF NOT EXISTS delta (
     block_num UInt32,
-    timestamp DateTime,
+    timestamp DateTime64(3),
     block_id String,
     code String,
     scope String,
     table String,
     primary_key String,
     payer String,
-    present Boolean,
+    present Bool,
     data String,
     value_hex Nullable(String),
     version UInt64,
@@ -236,13 +107,13 @@ CREATE TABLE IF NOT EXISTS delta (
     INDEX idx_table table TYPE set(1000)
 ) ENGINE = ReplacingMergeTree(version)
 PARTITION BY (block_num DIV 50000)
-ORDER BY (code, scope, table, block_num DESC, primary_key)
+ORDER BY (code, scope, table, block_num, primary_key)
 SETTINGS index_granularity = 8192;
 
 -- ABI table
 CREATE TABLE IF NOT EXISTS abi (
     block_num UInt32,
-    timestamp DateTime,
+    timestamp DateTime64(3),
     account String,
     abi String,
     actions Array(String),
@@ -252,29 +123,43 @@ CREATE TABLE IF NOT EXISTS abi (
     INDEX idx_account account TYPE set(1000)
 ) ENGINE = ReplacingMergeTree(version)
 PARTITION BY (block_num DIV 100000)
-ORDER BY (account, block_num DESC)
+ORDER BY (account, block_num)
 SETTINGS index_granularity = 4096;
 
--- Permission table (snapshot)
+-- Permission table (current-state snapshot, not a history log). ORDER BY is
+-- deliberately just (owner, name) with no block_num: ReplacingMergeTree only
+-- collapses rows that share the exact sort-key tuple, so including block_num
+-- (as the other, log-style tables do) would keep every historical update as
+-- a permanently-separate row instead of replacing it, defeating "FINAL gives
+-- you current state". A delete (permission removed) is written as a
+-- tombstone row with the same (owner, name) key and a higher version, with
+-- is_deleted = 1 (see `writer::doc_to_row`). Not partitioned: write volume is
+-- low enough that a single partition is simpler and keeps FINAL's dedup
+-- scope to one partition's merges.
 CREATE TABLE IF NOT EXISTS perm (
     block_num UInt32,
     owner String,
     name String,
     parent String,
-    last_updated DateTime,
+    last_updated DateTime64(3),
     keys Array(String),
     accounts Array(String),
     threshold UInt32,
     version UInt64,
+    is_deleted UInt8,
 
     INDEX idx_owner owner TYPE set(10000),
-    INDEX idx_keys keys TYPE arrayAll(bloom_filter())
+    -- `bloom_filter` applies directly to Array(String) columns - there is no
+    -- `arrayAll(...)` index type (confirmed against a real server:
+    -- "Only literals can be skip index arguments").
+    INDEX idx_keys keys TYPE bloom_filter()
 ) ENGINE = ReplacingMergeTree(version)
-PARTITION BY (block_num DIV 100000)
-ORDER BY (owner, name, block_num DESC)
+ORDER BY (owner, name)
 SETTINGS index_granularity = 8192;
 
--- Token table (snapshot)
+-- Token table (current-state snapshot) - see the `perm` table comment above -
+-- the same reasoning applies to its ORDER BY, is_deleted column, and lack of
+-- partitioning.
 CREATE TABLE IF NOT EXISTS token (
     block_num UInt32,
     code String,
@@ -283,12 +168,12 @@ CREATE TABLE IF NOT EXISTS token (
     precision UInt8,
     amount Float64,
     version UInt64,
+    is_deleted UInt8,
 
     INDEX idx_scope scope TYPE set(10000),
     INDEX idx_code_symbol (code, symbol) TYPE set(1000)
 ) ENGINE = ReplacingMergeTree(version)
-PARTITION BY (block_num DIV 100000)
-ORDER BY (scope, code, symbol, block_num DESC)
+ORDER BY (scope, code, symbol)
 SETTINGS index_granularity = 8192;
 
 -- Progress checkpoint table

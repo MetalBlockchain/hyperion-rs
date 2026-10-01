@@ -1,4 +1,4 @@
-use super::{search_sources, ApiResult, Shared};
+use super::{query_rows, ApiResult, Shared};
 use axum::extract::{Query, State};
 use axum::Json;
 use serde::Deserialize;
@@ -14,12 +14,9 @@ pub async fn get_key_accounts(
     Query(params): Query<KeyParams>,
 ) -> ApiResult {
     let key = antelope::keys::normalize_public_key(params.public_key.trim());
-    let body = json!({
-        "size": 1000,
-        "query": {"bool": {"filter": [{"term": {"keys": key}}]}},
-        "sort": [{"owner": {"order": "asc"}}],
-    });
-    let (hits, _, took) = search_sources(&state, "perm", body).await?;
+    let sql = crate::clickhouse::build_get_key_accounts_query(&key, 0, 1000)
+        .map_err(super::ApiError::internal)?;
+    let (hits, took) = query_rows(&state, &sql).await?;
     let mut account_names: Vec<&str> = hits.iter().filter_map(|p| p["owner"].as_str()).collect();
     account_names.dedup();
     Ok(Json(json!({
@@ -35,12 +32,9 @@ pub struct AccountParams {
 }
 
 async fn fetch_tokens(state: &Shared, account: &str) -> Result<Vec<Value>, super::ApiError> {
-    let body = json!({
-        "size": 1000,
-        "query": {"bool": {"filter": [{"term": {"scope": account}}]}},
-        "sort": [{"amount": {"order": "desc"}}],
-    });
-    let (hits, _, _) = search_sources(state, "token", body).await?;
+    let sql = crate::clickhouse::build_get_tokens_query(Some(account), None, 0, 1000)
+        .map_err(super::ApiError::internal)?;
+    let (hits, _) = query_rows(state, &sql).await?;
     Ok(hits
         .iter()
         .map(|t| {
@@ -71,24 +65,48 @@ pub async fn get_account(
 ) -> ApiResult {
     let tokens = fetch_tokens(&state, &params.account).await?;
 
-    let body = json!({
-        "track_total_hits": true,
-        "size": 20,
-        "query": {"bool": {"filter": [{"term": {"notified": params.account}}]}},
-        "sort": [{"global_sequence": {"order": "desc"}}],
-    });
-    let (mut actions, total, took) = search_sources(&state, "action", body).await?;
+    let actions_sql = crate::clickhouse::build_get_actions_query(
+        Some(&params.account),
+        None,
+        0,
+        20,
+        "desc",
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .map_err(super::ApiError::internal)?;
+    let count_sql = crate::clickhouse::build_get_actions_with_count_query(
+        Some(&params.account),
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .map_err(super::ApiError::internal)?;
+    let (action_rows, took) = query_rows(&state, &actions_sql).await?;
+    let (count_rows, _) = query_rows(&state, &count_sql).await?;
+    let total = count_rows
+        .first()
+        .map(|r| r["total"].clone())
+        .unwrap_or(json!(0));
+    let mut actions: Vec<Value> = action_rows
+        .iter()
+        .map(crate::clickhouse::action_doc)
+        .collect();
     for action in &mut actions {
         if let Some(ts) = action.get("@timestamp").cloned() {
             action["timestamp"] = ts;
         }
     }
 
-    let perm_body = json!({
-        "size": 100,
-        "query": {"bool": {"filter": [{"term": {"owner": params.account}}]}},
-    });
-    let (permissions, _, _) = search_sources(&state, "perm", perm_body).await?;
+    let perm_sql = crate::clickhouse::build_get_account_query(&params.account)
+        .map_err(super::ApiError::internal)?;
+    let (permissions, _) = query_rows(&state, &perm_sql).await?;
 
     Ok(Json(json!({
         "query_time_ms": took,
@@ -96,7 +114,7 @@ pub async fn get_account(
         "lib": state.lib().await,
         "tokens": tokens,
         "permissions": permissions,
-        "total_actions": total["value"],
+        "total_actions": total,
         "actions": actions,
     })))
 }

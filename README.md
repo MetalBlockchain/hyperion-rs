@@ -3,13 +3,13 @@
 A Rust implementation of [eosrio's Hyperion](https://github.com/eosrio/hyperion-history-api) —
 a full-history solution for Antelope (EOSIO) blockchains. It consumes the
 nodeos **state-history plugin (SHIP)** websocket feed, ABI-decodes action
-traces and table deltas, indexes them into **Elasticsearch**, and serves a
+traces and table deltas, indexes them into **ClickHouse**, and serves a
 Hyperion-compatible **v2 REST API** (plus a nodeos v1 history compatibility
 layer).
 
 ```
-┌────────┐  SHIP ws   ┌─────────┐   channel   ┌───────────┐   _bulk   ┌───────────────┐
-│ nodeos │ ─────────► │ reader  │ ──────────► │ processor │ ────────► │ Elasticsearch │
+┌────────┐  SHIP ws   ┌─────────┐   channel   ┌───────────┐  INSERT   ┌───────────────┐
+│ nodeos │ ─────────► │ reader  │ ──────────► │ processor │ ────────► │  ClickHouse   │
 └────────┘  (binary)  └─────────┘ (backpress.)└───────────┘           └───────┬───────┘
      ▲                                          │ ABI cache                   │
      └──────────── /v1/chain/get_abi ───────────┘                     ┌───────┴───────┐
@@ -28,9 +28,16 @@ layer).
 
 ## Design notes (vs. the Node.js original)
 
-- **No RabbitMQ** — the reader → processor → bulk-writer stages are
+- **No RabbitMQ** — the reader → processor → batch-writer stages are
   in-process Tokio tasks connected by bounded channels; SHIP's own
   credit-based flow control provides end-to-end backpressure.
+- **ClickHouse, not Elasticsearch** — every table is a `ReplacingMergeTree`
+  keyed by a version derived from block position, so a replayed or
+  out-of-order write is superseded rather than duplicated (see
+  `clickhouse::schema`). `action`/`block`/`delta`/`abi` are append-only
+  history; `perm`/`token` are current-state snapshots deduplicated by entity
+  key (not by block), with deletes written as tombstone rows
+  (`is_deleted = 1`) that every read query filters out explicitly.
 - **ABI handling** — contract ABIs are tracked in block order from
   state-history `account` deltas (and the system account's `setabi` actions),
   so historical action data decodes with the ABI that was active at that
@@ -50,15 +57,15 @@ layer).
   `act_digest`), matching Hyperion's query semantics. Deterministic document
   IDs (`global_sequence`, `block_num`, …) make reindexing idempotent and let
   microforks overwrite stale docs.
-- **Indices** — `{chain}-action`, `{chain}-block`, `{chain}-delta`,
-  `{chain}-abi`, `{chain}-perm` (current permissions, feeds
-  `get_key_accounts`), `{chain}-token` (current token balances, feeds
-  `get_tokens`).
+- **Tables** — `action`, `block`, `delta`, `abi`, `perm` (current permissions,
+  feeds `get_key_accounts`), `token` (current token balances, feeds
+  `get_tokens`). Table names are fixed, not chain-prefixed, so one ClickHouse
+  instance holds exactly one chain's history.
 
 ## Requirements
 
 - Rust 1.85+ (2021 edition workspace)
-- Elasticsearch 7/8 or OpenSearch
+- ClickHouse 23.8+ (tested against 24.10)
 - A nodeos instance with the state-history plugin enabled
   (`--plugin eosio::state_history_plugin --trace-history --chain-state-history`)
 
@@ -68,7 +75,7 @@ layer).
 cp config/example.toml config.toml   # then edit endpoints
 cargo build --release
 
-# fill Elasticsearch from state history (resumes automatically)
+# fill ClickHouse from state history (resumes automatically)
 ./target/release/hyperion indexer -c config.toml
 
 # serve the HTTP API
@@ -77,7 +84,7 @@ cargo build --release
 
 ### Docker
 
-`docker-compose.yml` runs a single-node Elasticsearch plus the indexer and
+`docker-compose.yml` runs a single-node ClickHouse plus the indexer and
 API (nodeos is not part of the stack — `config/docker.toml` defaults to a
 state-history node on the docker host via `host.docker.internal`):
 
@@ -88,15 +95,17 @@ docker compose up --build
 curl http://localhost:7000/v2/health
 ```
 
-Elasticsearch data persists in the `esdata` volume; the API is published on
-port 7000, Elasticsearch on 127.0.0.1:9200.
+ClickHouse data persists in the `chdata` volume; the API is published on
+port 7000, ClickHouse's HTTP interface on 127.0.0.1:8123.
 
 ### Indexing throughput
 
-Use a release build for indexing. Block processing and bulk serialization
-overlap with Elasticsearch writes; up to two serialized batches wait in the
-writer queue. Writes remain sequential to preserve token balances, permission
-updates, and fork replacement order.
+Use a release build for indexing. Block processing and row serialization
+overlap with ClickHouse inserts; up to `indexer.writer_concurrency` serialized
+batches run concurrently (each table's rows for a batch in one insert).
+Completions are confirmed in submission order so the resume checkpoint never
+advances past a batch that's still in flight or failed, even though
+ClickHouse may finish a later insert first.
 
 Raw block headers, transaction traces, and table deltas are decoded on a
 bounded CPU worker pool. `indexer.decode_workers` controls its concurrency;
@@ -108,13 +117,13 @@ an earlier block share the worker limit; another two decoded blocks can wait
 for the processor. Worker errors stop the pipeline. Already running CPU jobs
 may finish after cancellation, but cannot index documents.
 
-`indexer.batch_size` (default 2,000 documents) and `indexer.batch_max_bytes`
-(default 5 MiB) control batch targets. Both are checked after each complete
-block, so a large block can exceed them. Partial batches are queued after
-`flush_interval_ms` (default 500 ms); a busy writer can delay their submission.
-Bulk failures stop the pipeline rather than allowing later batches to advance
-the indexed position. Elasticsearch bulk writes are not atomic: after a partial
-failure, restart with an explicit `start_block` covering the failed batch.
+`indexer.batch_size` (default 2,000 rows) controls the batch target; there is
+no ClickHouse equivalent of a byte-size threshold. It is checked after each
+complete block, so a large block can exceed it. Partial batches are queued
+after `flush_interval_ms` (default 500 ms); a busy writer can delay their
+submission. Insert failures stop the pipeline rather than allowing later
+batches to advance the indexed position: after a partial failure, restart
+with an explicit `start_block` covering the failed batch.
 
 Run the reproducible synthetic pipeline benchmark with:
 
@@ -122,33 +131,17 @@ Run the reproducible synthetic pipeline benchmark with:
 cargo test --release -p hyperion --test e2e benchmark_pipeline -- --ignored --nocapture
 ```
 
-It uses local mock SHIP, chain API, and Elasticsearch servers. Its results
-measure processing and simulated write latency, not production Elasticsearch
-capacity. It compares 0, 1, 2, and 4 decoder workers; try the same comparison
-with a representative block sample before raising the worker count.
+It uses local mock SHIP, chain API, and ClickHouse servers (the mock only
+captures what the client would have inserted; it isn't a ClickHouse server).
+Its results measure processing and simulated write latency, not production
+ClickHouse capacity. It compares 0, 1, 2, and 4 decoder workers; try the same
+comparison with a representative block sample before raising the worker
+count.
 
-The initial pipeline optimizations (before parallel raw decoding) were compared
-against `22a377b`, using 4,000 synthetic blocks
-and 80,000 documents (median of three runs):
-
-| Simulated bulk delay | Before | After | Throughput gain |
-|---|---:|---:|---:|
-| 0 ms | 2,633 blocks/s | 3,336 blocks/s | 27% |
-| 10 ms | 2,103 blocks/s | 3,371 blocks/s | 60% |
-
-With parallel raw decoding added, the same workload produced these medians
-over three runs (all numbers are blocks/s):
-
-| Decoder workers | 0 ms bulk delay | 10 ms bulk delay |
-|---|---:|---:|
-| 0 (inline) | 3,579 | 3,621 |
-| 1 | 4,729 | 4,678 |
-| 2 | 4,662 | 4,509 |
-| 4 | 4,705 | 4,693 |
-
-Two workers improved throughput by 25–30% over inline decoding in this run.
-Increasing the worker count did not consistently improve this fixture; ABI
-processing and document construction still run sequentially.
+> The throughput numbers previously published here were measured against the
+> Elasticsearch writer this branch replaces and are no longer representative
+> - re-run the benchmark above against ClickHouse before relying on any
+> specific figure.
 
 ## API endpoints
 

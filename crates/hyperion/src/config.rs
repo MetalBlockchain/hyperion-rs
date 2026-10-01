@@ -7,8 +7,6 @@ pub struct Config {
     #[serde(default)]
     pub indexer: IndexerConfig,
     #[serde(default)]
-    pub elasticsearch: ElasticConfig,
-    #[serde(default)]
     pub clickhouse: ClickHouseConfig,
     #[serde(default)]
     pub api: ApiConfig,
@@ -55,19 +53,16 @@ pub struct IndexerConfig {
     pub max_messages_in_flight: u32,
     /// Concurrent raw block decoders; 0 decodes inline in the processor.
     pub decode_workers: usize,
-    /// Documents per bulk request.
+    /// Rows per insert batch.
     pub batch_size: usize,
-    /// Target maximum serialized bulk size, checked after each complete block.
-    pub batch_max_bytes: usize,
     /// Max time a partial batch may wait before being flushed.
     pub flush_interval_ms: u64,
     /// Actions to skip, as `contract::action` (e.g. `eosio::onblock`).
     pub skip_actions: Vec<String>,
-    /// Bulk requests allowed in flight at once. Each document carries an
-    /// external version derived from its block position, so Elasticsearch
-    /// itself rejects a stale write that lands out of order; completions are
-    /// still confirmed in submission order so the resume checkpoint never
-    /// advances past a batch that hasn't landed yet.
+    /// Insert requests allowed in flight at once. Completions are confirmed
+    /// in submission order so the resume checkpoint never advances past a
+    /// batch that hasn't landed yet, even though ClickHouse may finish a
+    /// later batch's insert first.
     pub writer_concurrency: usize,
 }
 
@@ -84,33 +79,9 @@ impl Default for IndexerConfig {
                 .map(|cpus| cpus.get().saturating_sub(1).min(2))
                 .unwrap_or(0),
             batch_size: 2000,
-            batch_max_bytes: 5 * 1024 * 1024,
             flush_interval_ms: 500,
             skip_actions: Vec::new(),
             writer_concurrency: 4,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
-pub struct ElasticConfig {
-    pub url: String,
-    pub user: String,
-    pub pass: String,
-    /// Number of shards for new indices.
-    pub shards: u32,
-    pub replicas: u32,
-}
-
-impl Default for ElasticConfig {
-    fn default() -> Self {
-        ElasticConfig {
-            url: "http://127.0.0.1:9200".to_string(),
-            user: String::new(),
-            pass: String::new(),
-            shards: 1,
-            replicas: 0,
         }
     }
 }
@@ -121,8 +92,6 @@ pub struct ClickHouseConfig {
     pub url: String,
     pub user: Option<String>,
     pub pass: Option<String>,
-    /// Enable ClickHouse indexing (dual-write or primary)
-    pub enabled: bool,
 }
 
 impl Default for ClickHouseConfig {
@@ -131,7 +100,6 @@ impl Default for ClickHouseConfig {
             url: "http://127.0.0.1:8123".to_string(),
             user: None,
             pass: None,
-            enabled: false,
         }
     }
 }
@@ -159,10 +127,5 @@ impl Config {
             .map_err(|e| anyhow::anyhow!("cannot read config {}: {e}", path.display()))?;
         let config: Config = toml::from_str(&raw)?;
         Ok(config)
-    }
-
-    /// Index name for a document type, e.g. `wax-action`.
-    pub fn index(&self, kind: &str) -> String {
-        format!("{}-{kind}", self.chain.name)
     }
 }

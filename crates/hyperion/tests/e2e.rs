@@ -1,8 +1,10 @@
 //! End-to-end pipeline test: a mock SHIP websocket server streams one
 //! synthetic block (token transfer with notifications, contract rows,
 //! permission delta, signed block header) to the real indexer, which writes
-//! to a mock Elasticsearch capturing `_bulk` bodies. Assertions run against
-//! the exact documents that would have been indexed.
+//! to a mock ClickHouse capturing `INSERT ... FORMAT TabSeparated` bodies.
+//! Assertions run against the exact rows that would have been inserted,
+//! reading fields by position (every table's column order is fixed by
+//! `clickhouse::schema::create_tables_sql`, with `block_num` always first).
 
 use antelope::Name;
 use axum::body::Bytes;
@@ -260,20 +262,49 @@ fn token_abi_json() -> Value {
     })
 }
 
-type BulkLog = Arc<Mutex<Vec<String>>>;
+/// `(table, tab_separated_row)` pairs captured from every insert this test
+/// run performed, in submission order per table (ClickHouse's own HTTP
+/// `query` parameter carries `INSERT INTO <table> FORMAT TabSeparated`; the
+/// mock below reads the table name out of that string).
+type InsertLog = Arc<Mutex<Vec<(String, String)>>>;
 
-async fn mock_es_handler(
-    State(bulk_log): State<BulkLog>,
+fn insert_table_name(query: &str) -> Option<&str> {
+    query.strip_prefix("INSERT INTO ")?.split(' ').next()
+}
+
+async fn mock_chain_and_clickhouse(
+    State(insert_log): State<InsertLog>,
     method: Method,
     uri: Uri,
     body: Bytes,
 ) -> impl IntoResponse {
     let path = uri.path();
+    // Minimal `application/x-www-form-urlencoded` decode of just the `query`
+    // parameter - avoids pulling in a URL-encoding crate for one mock.
+    let query_param: Option<String> = uri.query().and_then(|q| {
+        q.split('&').find_map(|pair| {
+            let (key, value) = pair.split_once('=')?;
+            (key == "query").then(|| {
+                value
+                    .replace('+', " ")
+                    .split('%')
+                    .enumerate()
+                    .map(|(i, part)| {
+                        if i == 0 {
+                            part.to_string()
+                        } else if part.len() >= 2 {
+                            let byte = u8::from_str_radix(&part[..2], 16).unwrap_or(b'?');
+                            format!("{}{}", byte as char, &part[2..])
+                        } else {
+                            part.to_string()
+                        }
+                    })
+                    .collect::<String>()
+            })
+        })
+    });
     match (method.as_str(), path) {
-        ("GET", "/") => (
-            StatusCode::OK,
-            json!({"version": {"number": "8.99.0-mock"}}).to_string(),
-        ),
+        ("GET", "/ping") => (StatusCode::OK, "Ok.".to_string()),
         ("POST", "/v1/chain/get_abi") => {
             let req: Value = serde_json::from_slice(&body).unwrap_or_default();
             let abi = if req["account_name"] == "eosio.token" {
@@ -283,7 +314,28 @@ async fn mock_es_handler(
             };
             (StatusCode::OK, abi.to_string())
         }
-        // PulseVM JSON-RPC 2.0 chain API (POSTed to the base URL).
+        // ClickHouse's HTTP interface: every non-insert statement (ping
+        // aside) is a GET with the SQL in `?query=`; inserts are POSTs with
+        // the SQL in `?query=` and the TabSeparated data as the body.
+        ("GET", "/") if query_param.is_some() => (StatusCode::OK, String::new()),
+        ("POST", "/")
+            if query_param
+                .as_deref()
+                .is_some_and(|q| q.starts_with("INSERT INTO")) =>
+        {
+            let query = query_param.unwrap();
+            let table = insert_table_name(&query)
+                .expect("insert query names a table")
+                .to_string();
+            let data = String::from_utf8_lossy(&body).into_owned();
+            let mut log = insert_log.lock().unwrap();
+            for line in data.lines() {
+                log.push((table.clone(), line.to_string()));
+            }
+            (StatusCode::OK, String::new())
+        }
+        // PulseVM JSON-RPC 2.0 chain API (POSTed to the base URL, same as
+        // ClickHouse's own POST / - distinguished by JSON vs `?query=`).
         ("POST", "/") => {
             let req: Value = serde_json::from_slice(&body).unwrap_or_default();
             let id = req["id"].clone();
@@ -312,16 +364,6 @@ async fn mock_es_handler(
                 }),
             };
             (StatusCode::OK, response.to_string())
-        }
-        ("POST", "/_bulk") => {
-            bulk_log
-                .lock()
-                .unwrap()
-                .push(String::from_utf8_lossy(&body).into_owned());
-            (
-                StatusCode::OK,
-                json!({"errors": false, "items": []}).to_string(),
-            )
         }
         _ => (StatusCode::OK, "{}".to_string()),
     }
@@ -376,9 +418,10 @@ async fn run_mock_ship(listener: tokio::net::TcpListener, transactions: u32) {
 
 // ---------------------------------------------------------------------------
 
-/// Spin up the mock SHIP + mock ES/chain-API servers, run the real indexer
-/// over one block, and return the (index, doc) pairs captured from `_bulk`.
-async fn run_pipeline(chain_api: &str) -> Vec<(String, Value)> {
+/// Spin up the mock SHIP + mock ClickHouse/chain-API servers, run the real
+/// indexer over one block, and return the `(table, row)` pairs that would
+/// have been inserted.
+async fn run_pipeline(chain_api: &str) -> Vec<(String, String)> {
     run_pipeline_options(chain_api, PipelineOptions::default())
         .await
         .unwrap()
@@ -388,9 +431,8 @@ struct PipelineOptions {
     blocks: u32,
     transactions: u32,
     batch_size: usize,
-    batch_max_bytes: usize,
-    bulk_delay_ms: u64,
-    fail_bulk: bool,
+    insert_delay_ms: u64,
+    fail_insert: bool,
     decode_workers: usize,
     writer_concurrency: usize,
 }
@@ -401,9 +443,8 @@ impl Default for PipelineOptions {
             blocks: 1,
             transactions: 1,
             batch_size: 2000,
-            batch_max_bytes: 5 * 1024 * 1024,
-            bulk_delay_ms: 0,
-            fail_bulk: false,
+            insert_delay_ms: 0,
+            fail_insert: false,
             decode_workers: 2,
             writer_concurrency: 4,
         }
@@ -413,26 +454,37 @@ impl Default for PipelineOptions {
 async fn run_pipeline_options(
     chain_api: &str,
     options: PipelineOptions,
-) -> anyhow::Result<Vec<(String, Value)>> {
-    let es_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let es_addr = es_listener.local_addr().unwrap();
-    let bulk_log: BulkLog = Arc::new(Mutex::new(Vec::new()));
+) -> anyhow::Result<Vec<(String, String)>> {
+    let ch_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let ch_addr = ch_listener.local_addr().unwrap();
+    let insert_log: InsertLog = Arc::new(Mutex::new(Vec::new()));
     let app = Router::new()
-        .fallback(move |state: State<BulkLog>, method: Method, uri: Uri, body: Bytes| async move {
-            if uri.path() == "/_bulk" {
-                tokio::time::sleep(std::time::Duration::from_millis(options.bulk_delay_ms)).await;
-                if options.fail_bulk {
-                    return (StatusCode::OK, json!({"errors": true, "items": [
-                        {"index": {"status": 429, "error": {"type": "es_rejected_execution_exception"}}}
-                    ]}).to_string()).into_response();
+        .fallback(
+            move |state: State<InsertLog>, method: Method, uri: Uri, body: Bytes| async move {
+                let is_insert = method == Method::POST
+                    && uri
+                        .query()
+                        .is_some_and(|q| q.contains("INSERT+INTO") || q.contains("INSERT%20INTO"));
+                if is_insert {
+                    tokio::time::sleep(std::time::Duration::from_millis(options.insert_delay_ms))
+                        .await;
+                    if options.fail_insert {
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "injected failure".to_string(),
+                        )
+                            .into_response();
+                    }
                 }
-            }
-            mock_es_handler(state, method, uri, body).await.into_response()
-        })
-        .with_state(bulk_log.clone())
+                mock_chain_and_clickhouse(state, method, uri, body)
+                    .await
+                    .into_response()
+            },
+        )
+        .with_state(insert_log.clone())
         .layer(axum::extract::DefaultBodyLimit::disable());
     let mut servers = tokio::task::JoinSet::new();
-    servers.spawn(async move { axum::serve(es_listener, app).await.unwrap() });
+    servers.spawn(async move { axum::serve(ch_listener, app).await.unwrap() });
 
     let ship_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let ship_addr = ship_listener.local_addr().unwrap();
@@ -440,7 +492,6 @@ async fn run_pipeline_options(
 
     let stop_block = 41 + options.blocks;
     let batch_size = options.batch_size;
-    let batch_max_bytes = options.batch_max_bytes;
     let decode_workers = options.decode_workers;
     let writer_concurrency = options.writer_concurrency;
 
@@ -448,7 +499,7 @@ async fn run_pipeline_options(
         r#"
         [chain]
         name = "test"
-        http = "http://{es_addr}"
+        http = "http://{ch_addr}"
         ship = "ws://{ship_addr}"
         api = "{chain_api}"
 
@@ -456,12 +507,11 @@ async fn run_pipeline_options(
         start_block = 42
         stop_block = {stop_block}
         batch_size = {batch_size}
-        batch_max_bytes = {batch_max_bytes}
         decode_workers = {decode_workers}
         writer_concurrency = {writer_concurrency}
 
-        [elasticsearch]
-        url = "http://{es_addr}"
+        [clickhouse]
+        url = "http://{ch_addr}"
         "#
     ))
     .unwrap();
@@ -473,45 +523,43 @@ async fn run_pipeline_options(
     .await
     .expect("indexer timed out")?;
 
-    // Parse every doc out of the captured bulk bodies: action lines are
-    // `{"index": {...}}\n{doc}` pairs.
-    let mut docs: Vec<(String, Value)> = Vec::new();
-    for body in bulk_log.lock().unwrap().iter() {
-        let mut lines = body.lines();
-        while let Some(meta) = lines.next() {
-            let meta: Value = serde_json::from_str(meta).unwrap();
-            if let Some(op) = meta.get("index") {
-                let doc: Value = serde_json::from_str(lines.next().unwrap()).unwrap();
-                docs.push((op["_index"].as_str().unwrap().to_string(), doc));
-            }
-        }
-    }
-    Ok(docs)
+    let rows = insert_log.lock().unwrap().clone();
+    Ok(rows)
+}
+
+/// Split a captured TabSeparated row into its raw field strings. Array/tuple
+/// columns (`writer::array_to_string`/`tuple_array_to_string`) contain no
+/// literal tabs - their contents are escaped per-element - so a plain split
+/// on `\t` is exact.
+fn fields(row: &str) -> Vec<&str> {
+    row.split('\t').collect()
 }
 
 #[tokio::test]
 async fn drains_ordered_batches_with_a_slow_writer() {
-    // Force both document-count and byte-size flushes in separate runs.
-    for (batch_size, batch_max_bytes) in [(1, i64::MAX as usize), (i64::MAX as usize, 1)] {
+    // Force a flush on every single row (there is no ClickHouse equivalent
+    // of the old byte-size threshold - see `indexer::process_blocks`), then
+    // confirm a large threshold still flushes everything via the
+    // end-of-stream drain. `i64::MAX` is TOML's own integer ceiling.
+    for batch_size in [1, i64::MAX as usize] {
         let docs = run_pipeline_options(
             "antelope",
             PipelineOptions {
                 blocks: 12,
                 batch_size,
-                batch_max_bytes,
-                bulk_delay_ms: 2,
+                insert_delay_ms: 2,
                 ..Default::default()
             },
         )
         .await
         .unwrap();
-        for kind in ["block", "action", "delta", "token", "perm"] {
+        for table in ["block", "action", "delta", "token", "perm"] {
             let numbers: Vec<_> = docs
                 .iter()
-                .filter(|(index, _)| index == &format!("test-{kind}"))
-                .map(|(_, doc)| doc["block_num"].as_u64().unwrap())
+                .filter(|(t, _)| t == table)
+                .map(|(_, row)| fields(row)[0].parse::<u64>().unwrap())
                 .collect();
-            assert_eq!(numbers, (42..54).collect::<Vec<_>>(), "{kind} write order");
+            assert_eq!(numbers, (42..54).collect::<Vec<_>>(), "{table} write order");
         }
     }
 }
@@ -549,20 +597,20 @@ async fn parallel_decoding_matches_inline_documents() {
 }
 
 #[tokio::test]
-async fn propagates_bulk_item_failures() {
+async fn propagates_insert_failures() {
     let error = run_pipeline_options(
         "antelope",
         PipelineOptions {
             blocks: 12,
             batch_size: 1,
-            fail_bulk: true,
+            fail_insert: true,
             ..Default::default()
         },
     )
     .await
     .unwrap_err();
     assert!(
-        error.to_string().contains("bulk indexing failed"),
+        error.to_string().contains("clickhouse insert failed"),
         "{error}"
     );
 }
@@ -579,7 +627,7 @@ async fn benchmark_pipeline() {
                 PipelineOptions {
                     blocks,
                     transactions: 16,
-                    bulk_delay_ms: delay,
+                    insert_delay_ms: delay,
                     decode_workers: 2,
                     writer_concurrency,
                     ..Default::default()
@@ -590,7 +638,7 @@ async fn benchmark_pipeline() {
             let elapsed = start.elapsed();
             assert_eq!(docs.len(), blocks as usize * 20);
             eprintln!(
-            "writer_concurrency={writer_concurrency}, bulk_delay_ms={delay}: {blocks} blocks, {} docs in {:.3}s ({:.0} blocks/s)",
+            "writer_concurrency={writer_concurrency}, insert_delay_ms={delay}: {blocks} blocks, {} docs in {:.3}s ({:.0} blocks/s)",
             docs.len(),
             elapsed.as_secs_f64(),
             blocks as f64 / elapsed.as_secs_f64()
@@ -607,88 +655,101 @@ async fn indexes_with_pulsevm_chain_api() {
     let docs = run_pipeline("pulsevm").await;
     let action = docs
         .iter()
-        .find(|(i, _)| i == "test-action")
-        .map(|(_, d)| d)
-        .expect("action doc missing");
-    assert_eq!(action["act"]["data"]["quantity"], "1.0000 EOS");
-    assert_eq!(action["act"]["data"]["from"], "alice");
+        .find(|(t, _)| t == "action")
+        .map(|(_, row)| fields(row))
+        .expect("action row missing");
+    let act_data: Value = serde_json::from_str(action[9]).unwrap();
+    assert_eq!(act_data["quantity"], "1.0000 EOS");
+    assert_eq!(act_data["from"], "alice");
+
     let delta = docs
         .iter()
-        .find(|(i, _)| i == "test-delta")
-        .map(|(_, d)| d)
+        .find(|(t, _)| t == "delta")
+        .map(|(_, row)| fields(row))
         .unwrap();
-    assert_eq!(delta["data"]["balance"], "12.3456 EOS");
+    let delta_data: Value = serde_json::from_str(delta[9]).unwrap();
+    assert_eq!(delta_data["balance"], "12.3456 EOS");
 }
 
 #[tokio::test]
 async fn indexes_a_block_end_to_end() {
     let docs = run_pipeline("antelope").await;
 
-    // Exactly one action doc: the three notification traces collapse.
-    let actions: Vec<&Value> = docs
+    // Exactly one action row: the three notification traces collapse.
+    let actions: Vec<Vec<&str>> = docs
         .iter()
-        .filter(|(i, _)| i == "test-action")
-        .map(|(_, d)| d)
+        .filter(|(t, _)| t == "action")
+        .map(|(_, row)| fields(row))
         .collect();
     assert_eq!(
         actions.len(),
         1,
-        "notifications should collapse into one doc"
+        "notifications should collapse into one row"
     );
-    let action = actions[0];
-    assert_eq!(action["global_sequence"], 777);
-    assert_eq!(action["block_num"], 42);
-    assert_eq!(action["trx_id"], "ee".repeat(32));
-    assert_eq!(action["producer"], "producer1");
-    assert_eq!(action["act"]["account"], "eosio.token");
-    assert_eq!(action["act"]["name"], "transfer");
-    assert_eq!(action["act"]["data"]["from"], "alice");
-    assert_eq!(action["act"]["data"]["quantity"], "1.0000 EOS");
-    assert_eq!(action["notified"], json!(["eosio.token", "alice", "bob"]));
-    assert_eq!(action["receipts"].as_array().unwrap().len(), 3);
-    assert!(action["signatures"][0]
-        .as_str()
-        .unwrap()
-        .starts_with("SIG_K1_"));
+    let action = &actions[0];
+    assert_eq!(action[0], "42", "block_num"); // block_num
+    assert_eq!(action[1], "777", "global_sequence");
+    assert_eq!(action[4], "ee".repeat(32), "trx_id");
+    assert_eq!(action[5], "producer1", "producer");
+    assert_eq!(action[6], "eosio.token", "act_account");
+    assert_eq!(action[7], "transfer", "act_name");
+    let act_data: Value = serde_json::from_str(action[9]).unwrap();
+    assert_eq!(act_data["from"], "alice");
+    assert_eq!(act_data["quantity"], "1.0000 EOS");
+    assert_eq!(action[18], "['eosio.token','alice','bob']", "notified");
+    // receipts: one Tuple(receiver, global_sequence) per notification.
+    assert_eq!(
+        action[19].matches("),(").count() + 1,
+        3,
+        "receipts: {}",
+        action[19]
+    );
+    assert!(action[24].contains("SIG_K1_"), "signatures: {}", action[24]);
 
     let block = docs
         .iter()
-        .find(|(i, _)| i == "test-block")
-        .map(|(_, d)| d)
+        .find(|(t, _)| t == "block")
+        .map(|(_, row)| fields(row))
         .unwrap();
-    assert_eq!(block["block_num"], 42);
-    assert_eq!(block["producer"], "producer1");
-    assert_eq!(block["trx_count"], 1);
-    // slot 1000 => 2000-01-01T00:08:20.000
-    assert_eq!(block["@timestamp"], "2000-01-01T00:08:20.000");
+    assert_eq!(block[0], "42", "block_num");
+    assert_eq!(block[4], "producer1", "producer");
+    assert_eq!(block[6], "1", "trx_count");
+    // slot 1000 => 2000-01-01T00:08:20.000. The writer passes
+    // `processor`'s ISO-8601 string straight through as the TSV field (see
+    // `writer::block_row`); a real ClickHouse server stores it as `DateTime`
+    // (whole-second resolution, its own text format on read-back) rather
+    // than preserving this exact string - this mock only captures what was
+    // sent, not what ClickHouse would make of it.
+    assert_eq!(block[1], "2000-01-01T00:08:20.000", "timestamp");
 
     let delta = docs
         .iter()
-        .find(|(i, _)| i == "test-delta")
-        .map(|(_, d)| d)
+        .find(|(t, _)| t == "delta")
+        .map(|(_, row)| fields(row))
         .unwrap();
-    assert_eq!(delta["code"], "eosio.token");
-    assert_eq!(delta["table"], "accounts");
-    assert_eq!(delta["data"]["balance"], "12.3456 EOS");
+    assert_eq!(delta[3], "eosio.token", "code");
+    assert_eq!(delta[5], "accounts", "table");
+    let delta_data: Value = serde_json::from_str(delta[9]).unwrap();
+    assert_eq!(delta_data["balance"], "12.3456 EOS");
 
     let token = docs
         .iter()
-        .find(|(i, _)| i == "test-token")
-        .map(|(_, d)| d)
+        .find(|(t, _)| t == "token")
+        .map(|(_, row)| fields(row))
         .unwrap();
-    assert_eq!(token["scope"], "alice");
-    assert_eq!(token["symbol"], "EOS");
-    assert_eq!(token["amount"], 12.3456);
+    assert_eq!(token[2], "alice", "scope");
+    assert_eq!(token[3], "EOS", "symbol");
+    assert_eq!(token[5], "12.3456", "amount");
 
     let perm = docs
         .iter()
-        .find(|(i, _)| i == "test-perm")
-        .map(|(_, d)| d)
+        .find(|(t, _)| t == "perm")
+        .map(|(_, row)| fields(row))
         .unwrap();
-    assert_eq!(perm["owner"], "bob");
-    assert_eq!(perm["name"], "active");
+    assert_eq!(perm[1], "bob", "owner");
+    assert_eq!(perm[2], "active", "name");
     assert_eq!(
-        perm["keys"],
-        json!(["PUB_K1_11111111111111111111111111111111149Mr2R"])
+        perm[5], "['PUB_K1_11111111111111111111111111111111149Mr2R']",
+        "keys"
     );
 }

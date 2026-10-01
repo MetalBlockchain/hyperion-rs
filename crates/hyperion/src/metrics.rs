@@ -30,6 +30,12 @@ pub struct Metrics {
     pub divergences_total: Arc<AtomicU64>,
 }
 
+impl Default for Metrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Metrics {
     pub fn new() -> Self {
         Metrics {
@@ -49,13 +55,15 @@ impl Metrics {
 
     pub fn record_ch_insert(&self, rows: u64, latency_ms: u64) {
         self.ch_rows_inserted.fetch_add(rows, Ordering::Relaxed);
-        self.ch_insert_latency_ms.store(latency_ms, Ordering::Relaxed);
+        self.ch_insert_latency_ms
+            .store(latency_ms, Ordering::Relaxed);
         self.batch_inserts_total.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn record_es_insert(&self, rows: u64, latency_ms: u64) {
         self.es_rows_inserted.fetch_add(rows, Ordering::Relaxed);
-        self.es_insert_latency_ms.store(latency_ms, Ordering::Relaxed);
+        self.es_insert_latency_ms
+            .store(latency_ms, Ordering::Relaxed);
     }
 
     pub fn record_insert_error(&self) {
@@ -68,7 +76,8 @@ impl Metrics {
     }
 
     pub fn set_checkpoint(&self, block_num: u32) {
-        self.checkpoint_block.store(block_num as u64, Ordering::Relaxed);
+        self.checkpoint_block
+            .store(block_num as u64, Ordering::Relaxed);
     }
 
     pub fn record_divergence(&self) {

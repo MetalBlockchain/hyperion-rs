@@ -5,8 +5,8 @@ mod history;
 mod state;
 mod v1;
 
+use crate::clickhouse::ClickHouse;
 use crate::config::Config;
-use crate::elastic::Elastic;
 use anyhow::{Context, Result};
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
 pub struct ApiState {
-    pub es: Elastic,
+    pub ck: ClickHouse,
     pub config: Config,
     pub chain: crate::chain_client::ChainClient,
     lib_cache: Mutex<Option<(Instant, Value)>>,
@@ -80,8 +80,13 @@ pub type ApiResult = std::result::Result<Json<Value>, ApiError>;
 
 pub async fn run(config: Config) -> Result<()> {
     let listen = config.api.listen.clone();
+    let ck = ClickHouse::new(
+        config.clickhouse.url.clone(),
+        config.clickhouse.user.clone(),
+        config.clickhouse.pass.clone(),
+    );
     let state: Shared = Arc::new(ApiState {
-        es: Elastic::new(&config.elasticsearch),
+        ck,
         chain: config.chain.client(),
         config,
         lib_cache: Mutex::new(None),
@@ -155,48 +160,22 @@ pub fn clamp_limit(state: &ApiState, limit: Option<usize>) -> usize {
     limit.unwrap_or(100).min(state.config.api.max_limit)
 }
 
-/// Interpret an `after`/`before` boundary: integers are block numbers,
-/// anything else is treated as an ISO timestamp.
-pub fn range_filters(after: Option<&str>, before: Option<&str>) -> Vec<Value> {
-    let mut filters = Vec::new();
-    let mut block_range = serde_json::Map::new();
-    let mut time_range = serde_json::Map::new();
-    for (bound, value) in [("gte", after), ("lte", before)] {
-        if let Some(value) = value {
-            if let Ok(block) = value.parse::<u64>() {
-                block_range.insert(bound.to_string(), json!(block));
-            } else {
-                time_range.insert(bound.to_string(), json!(value));
-            }
-        }
-    }
-    if !block_range.is_empty() {
-        filters.push(json!({"range": {"block_num": block_range}}));
-    }
-    if !time_range.is_empty() {
-        filters.push(json!({"range": {"@timestamp": time_range}}));
-    }
-    filters
+/// `after`/`before` as block-number bounds: only an integer value is
+/// meaningful as a block range filter here (unlike the old Elasticsearch
+/// path, nothing downstream falls back to filtering by timestamp instead).
+pub fn parse_block_bound(value: &str) -> std::result::Result<u64, ApiError> {
+    value
+        .parse()
+        .map_err(|_| ApiError::bad_request(format!("not a block number: {value}")))
 }
 
-/// Run a search and return `(hits_sources, total, took_ms)`.
-pub async fn search_sources(
+/// Run a `SELECT` against ClickHouse and return `(rows, took_ms)`.
+pub async fn query_rows(
     state: &ApiState,
-    index_kind: &str,
-    body: Value,
-) -> std::result::Result<(Vec<Value>, Value, u64), ApiError> {
-    let index = state.config.index(index_kind);
+    sql: &str,
+) -> std::result::Result<(Vec<Value>, u64), ApiError> {
     let started = Instant::now();
-    let res = state
-        .es
-        .search(&index, body)
-        .await
-        .map_err(ApiError::internal)?;
+    let rows = state.ck.query_rows(sql).await.map_err(ApiError::internal)?;
     let took = started.elapsed().as_millis() as u64;
-    let hits = res["hits"]["hits"]
-        .as_array()
-        .map(|hits| hits.iter().map(|h| h["_source"].clone()).collect())
-        .unwrap_or_default();
-    let total = res["hits"]["total"].clone();
-    Ok((hits, total, took))
+    Ok((rows, took))
 }

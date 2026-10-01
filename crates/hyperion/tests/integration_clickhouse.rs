@@ -1,27 +1,47 @@
 //! Integration test for ClickHouse indexing pipeline.
 //!
-//! Run with: cargo test --test integration_clickhouse -- --ignored --nocapture
+//! Run with: cargo test --test integration_clickhouse -- --ignored --nocapture --test-threads=1
+//!
+//! `--test-threads=1` matters here, not just for tidy output: every test in
+//! this file shares one ClickHouse instance and calls `drop_all()`/
+//! `create_all()` on the same fixed table names, so running them
+//! concurrently means one test's `drop_all()` can delete another's
+//! in-progress data.
 //!
 //! Requirements:
-//! - ClickHouse running at http://localhost:8123
+//! - ClickHouse running at http://localhost:8123 (override with CLICKHOUSE_URL),
+//!   with no auth required (or set CLICKHOUSE_USER/CLICKHOUSE_PASSWORD).
 
 use anyhow::Result;
-use hyperion::clickhouse::{ClickHouse, ClickHouseBatch, doc_to_row};
+use hyperion::clickhouse::{doc_to_row, ClickHouse, ClickHouseBatch};
 use hyperion::processor::{Doc, Op};
-use serde_json::{json, Value};
+use serde_json::json;
+
+fn test_clickhouse() -> ClickHouse {
+    let url =
+        std::env::var("CLICKHOUSE_URL").unwrap_or_else(|_| "http://localhost:8123".to_string());
+    ClickHouse::new(
+        url,
+        std::env::var("CLICKHOUSE_USER").ok(),
+        std::env::var("CLICKHOUSE_PASSWORD").ok(),
+    )
+}
 
 #[tokio::test]
 #[ignore]
 async fn test_full_ingestion_pipeline() -> Result<()> {
     println!("\n=== Full ClickHouse Ingestion Pipeline Test ===\n");
 
-    let ck = ClickHouse::new("http://localhost:8123", None, None);
+    let ck = test_clickhouse();
 
     // Verify connection
     ck.ping().await?;
     println!("✓ Connected to ClickHouse");
 
-    // Create tables
+    // Start from a clean slate: these tests assert exact row counts, which a
+    // previous run's leftover data (e.g. from a run that panicked before its
+    // own `drop_all()`) would silently throw off.
+    ck.drop_all().await.ok();
     ck.create_all().await?;
     println!("✓ Created all tables");
 
@@ -35,7 +55,7 @@ async fn test_full_ingestion_pipeline() -> Result<()> {
             kind: "block",
             id: Some(block_num.to_string()),
             body: json!({
-                "@timestamp": "2024-01-01T00:00:00Z",
+                "@timestamp": "2024-01-01 00:00:00",
                 "block_num": block_num,
                 "block_id": format!("{:064x}", block_num),
                 "prev_id": format!("{:064x}", block_num - 1),
@@ -48,7 +68,7 @@ async fn test_full_ingestion_pipeline() -> Result<()> {
             op: Op::Index,
         };
 
-        let version = ((block_num as u64) << 32) | 0;
+        let version = (block_num as u64) << 32;
         batch.push(&block_doc, version)?;
 
         // Create 10 action documents per block
@@ -57,7 +77,7 @@ async fn test_full_ingestion_pipeline() -> Result<()> {
                 kind: "action",
                 id: Some(format!("{}-{}", block_num, seq)),
                 body: json!({
-                    "@timestamp": "2024-01-01T00:00:00Z",
+                    "@timestamp": "2024-01-01 00:00:00",
                     "block_num": block_num,
                     "global_sequence": (block_num as u64 * 100) + seq as u64,
                     "block_id": format!("{:064x}", block_num),
@@ -111,7 +131,10 @@ async fn test_full_ingestion_pipeline() -> Result<()> {
     println!("\n📊 Batch created:");
     println!("   Total documents: {}", batch.count);
     println!("   Max block: {}", batch.max_block);
-    println!("   Tables: {:?}", batch.rows_by_table.keys().collect::<Vec<_>>());
+    println!(
+        "   Tables: {:?}",
+        batch.rows_by_table.keys().collect::<Vec<_>>()
+    );
 
     // Insert batch
     println!("\n📝 Inserting batch...");
@@ -127,7 +150,10 @@ async fn test_full_ingestion_pipeline() -> Result<()> {
 
     let elapsed = start.elapsed();
     println!("\n✓ Batch inserted in {:?}", elapsed);
-    println!("  Rate: {:.0} docs/sec", batch.count as f64 / elapsed.as_secs_f64());
+    println!(
+        "  Rate: {:.0} docs/sec",
+        batch.count as f64 / elapsed.as_secs_f64()
+    );
 
     // Verify counts
     println!("\n📊 Verifying data:");
@@ -141,7 +167,7 @@ async fn test_full_ingestion_pipeline() -> Result<()> {
 
     // Test checkpoint
     println!("\n🔖 Testing checkpoint:");
-    let version = (5u64 << 32) | 0;
+    let version = 5u64 << 32;
     ck.set_checkpoint(5, version).await?;
     let checkpoint = ck.get_checkpoint().await?;
     println!("   Checkpoint: {:?}", checkpoint);
@@ -179,7 +205,7 @@ async fn test_row_serialization() -> Result<()> {
         kind: "action",
         id: Some("test".to_string()),
         body: json!({
-            "@timestamp": "2024-01-01T00:00:00Z",
+            "@timestamp": "2024-01-01 00:00:00",
             "block_num": 100,
             "global_sequence": 1000,
             "block_id": "deadbeef",
@@ -214,7 +240,7 @@ async fn test_row_serialization() -> Result<()> {
         op: Op::Index,
     };
 
-    let version = (100u64 << 32) | 0;
+    let version = 100u64 << 32;
     let row = doc_to_row(&action_doc, version)?;
 
     println!("Action row fields: {}", row.len());
@@ -240,7 +266,8 @@ async fn test_row_serialization() -> Result<()> {
 async fn test_batch_operations() -> Result<()> {
     println!("\n=== Batch Operations Test ===\n");
 
-    let ck = ClickHouse::new("http://localhost:8123", None, None);
+    let ck = test_clickhouse();
+    ck.drop_all().await.ok();
     ck.create_all().await?;
 
     let mut batch = ClickHouseBatch::new();
@@ -252,7 +279,7 @@ async fn test_batch_operations() -> Result<()> {
             kind: "block",
             id: Some(block.to_string()),
             body: json!({
-                "@timestamp": "2024-01-01T00:00:00Z",
+                "@timestamp": "2024-01-01 00:00:00",
                 "block_num": block,
                 "block_id": format!("{:064x}", block),
                 "prev_id": format!("{:064x}", block - 1),
@@ -265,17 +292,21 @@ async fn test_batch_operations() -> Result<()> {
             op: Op::Index,
         };
 
-        let version = ((block as u64) << 32) | 0;
+        let version = (block as u64) << 32;
         batch.push(&block_doc, version)?;
 
-        // Token snapshot document
+        // Token snapshot document. `token`/`perm` are current-state
+        // snapshots deduplicated by entity key, not by block_num (see the
+        // comment on the `perm` table in `schema.rs`) - a distinct scope per
+        // block here makes these three genuinely distinct entities, rather
+        // than three versions of one that FINAL would collapse to one row.
         let token_doc = Doc {
             kind: "token",
-            id: Some(format!("eosio.token-{}-EOS", block)),
+            id: Some(format!("eosio.token-alice{block}-EOS")),
             body: json!({
                 "block_num": block,
                 "code": "eosio.token",
-                "scope": "alice",
+                "scope": format!("alice{block}"),
                 "symbol": "EOS",
                 "precision": 4,
                 "amount": 1000.0
@@ -285,16 +316,16 @@ async fn test_batch_operations() -> Result<()> {
 
         batch.push(&token_doc, version)?;
 
-        // Permission snapshot document
+        // Permission snapshot document (same distinct-entity reasoning).
         let perm_doc = Doc {
             kind: "perm",
-            id: Some(format!("alice-active-{}", block)),
+            id: Some(format!("alice{block}-active")),
             body: json!({
                 "block_num": block,
-                "owner": "alice",
+                "owner": format!("alice{block}"),
                 "name": "active",
                 "parent": "owner",
-                "last_updated": "2024-01-01T00:00:00Z",
+                "last_updated": "2024-01-01 00:00:00",
                 "keys": ["PUB_K1_123"],
                 "accounts": [],
                 "threshold": 1
@@ -307,7 +338,10 @@ async fn test_batch_operations() -> Result<()> {
 
     println!("📊 Multi-table batch created:");
     println!("   Documents: {}", batch.count);
-    println!("   Tables: {:?}", batch.rows_by_table.keys().collect::<Vec<_>>());
+    println!(
+        "   Tables: {:?}",
+        batch.rows_by_table.keys().collect::<Vec<_>>()
+    );
 
     // Insert
     for table in &["block", "token", "perm"] {
