@@ -284,7 +284,7 @@ pub async fn write_batches(
             completed += 1;
             if max_block > checkpoint {
                 checkpoint = max_block;
-                let version = (u64::from(checkpoint) << 32) | 0;
+                let version = ((checkpoint as u64) << 32) | 0;
                 ck.set_checkpoint(checkpoint, version).await?;
                 tracing::debug!(checkpoint, "advanced checkpoint");
             }

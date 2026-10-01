@@ -1,4 +1,5 @@
 pub mod client;
+pub mod dual_write;
 pub mod queries;
 pub mod schema;
 pub mod writer;
@@ -10,3 +11,4 @@ pub use queries::{
     build_get_actions_query, build_get_tokens_query, build_get_key_accounts_query,
     build_get_account_query,
 };
+pub use dual_write::{DivergenceCounter, write_both, shadow_read};
