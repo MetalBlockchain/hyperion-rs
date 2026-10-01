@@ -4,6 +4,7 @@
 pub mod abis;
 pub mod api;
 pub mod chain_client;
+pub mod clickhouse;
 pub mod config;
 pub mod elastic;
 pub mod indexer;
