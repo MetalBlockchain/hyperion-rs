@@ -54,10 +54,10 @@ pub fn build_get_actions_query(
     }
 
     if let Some(after) = after_seq {
-        where_clauses.push(format!("global_sequence < {}", after));
+        where_clauses.push(format!("global_sequence > {}", after));
     }
     if let Some(before) = before_seq {
-        where_clauses.push(format!("global_sequence > {}", before));
+        where_clauses.push(format!("global_sequence < {}", before));
     }
 
     let sort_dir = if sort_order == "asc" { "ASC" } else { "DESC" };

@@ -75,11 +75,11 @@ fn action_row(doc: &Doc, version: u64) -> Result<Vec<String>> {
         tuple_array_to_string("authorization", obj["act"]["authorization"].as_array().unwrap_or(&vec![])),
         serde_json::to_string(&obj["act"]["data"]).unwrap_or_default(),
         obj["act"]["hex_data"].as_str().map(escape_tab_separated).unwrap_or_default(),
-        obj["@transfer"]["from"].as_str().map(escape_tab_separated).unwrap_or_default(),
-        obj["@transfer"]["to"].as_str().map(escape_tab_separated).unwrap_or_default(),
+        obj["@transfer"]["from"].as_str().map(|s| s.to_string()).unwrap_or_default(),
+        obj["@transfer"]["to"].as_str().map(|s| s.to_string()).unwrap_or_default(),
         obj["@transfer"]["amount"].as_f64().map(|f| f.to_string()).unwrap_or_default(),
-        obj["@transfer"]["symbol"].as_str().map(escape_tab_separated).unwrap_or_default(),
-        obj["@transfer"]["memo"].as_str().map(escape_tab_separated).unwrap_or_default(),
+        obj["@transfer"]["symbol"].as_str().map(|s| s.to_string()).unwrap_or_default(),
+        obj["@transfer"]["memo"].as_str().map(|s| s.to_string()).unwrap_or_default(),
         array_to_string(
             &obj["notified"]
                 .as_array()
@@ -327,16 +327,16 @@ pub async fn write_batches(
                                     "batch inserted"
                                 );
                             }
-                            (ordinal, max_block, result)
+                            (max_block, result)
                         });
                     }
                     None => closed = true,
                 }
             }
             result = jobs.join_next(), if !jobs.is_empty() => {
-                let (ordinal, max_block, res) = result.expect("nonempty jobs")
+                let (max_block, res) = result.expect("nonempty jobs")
                     .context("clickhouse writer task failed")?;
-                ready.insert(ordinal, (max_block, res));
+                ready.insert(completed + ready.len() as u64, (max_block, res));
             }
         }
     }

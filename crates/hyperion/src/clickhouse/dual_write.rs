@@ -101,14 +101,27 @@ pub async fn write_both(
             tracing::debug!(max_block, "both backends advanced checkpoint");
             Ok(())
         }
-        _ => {
-            if es_result.is_err() {
-                es_result?;
-            }
-            if ck_result.is_err() {
-                ck_result?;
-            }
-            Ok(())
+        (Err(es_err), Err(ck_err)) => {
+            // Both failed - report both errors
+            Err(anyhow::anyhow!(
+                "both backends failed: ES={}, CH={}",
+                es_err,
+                ck_err
+            ))
+        }
+        (Err(es_err), Ok(_)) => {
+            // ES failed, CH succeeded - both are in inconsistent state
+            Err(anyhow::anyhow!(
+                "dual-write divergence: ES failed but CH succeeded: {}",
+                es_err
+            ))
+        }
+        (Ok(_), Err(ck_err)) => {
+            // CH failed, ES succeeded - both are in inconsistent state
+            Err(anyhow::anyhow!(
+                "dual-write divergence: CH failed but ES succeeded: {}",
+                ck_err
+            ))
         }
     }
 }
