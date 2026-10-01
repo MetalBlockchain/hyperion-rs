@@ -9,6 +9,8 @@ pub struct Config {
     #[serde(default)]
     pub elasticsearch: ElasticConfig,
     #[serde(default)]
+    pub clickhouse: ClickHouseConfig,
+    #[serde(default)]
     pub api: ApiConfig,
 }
 
@@ -109,6 +111,27 @@ impl Default for ElasticConfig {
             pass: String::new(),
             shards: 1,
             replicas: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct ClickHouseConfig {
+    pub url: String,
+    pub user: Option<String>,
+    pub pass: Option<String>,
+    /// Enable ClickHouse indexing (dual-write or primary)
+    pub enabled: bool,
+}
+
+impl Default for ClickHouseConfig {
+    fn default() -> Self {
+        ClickHouseConfig {
+            url: "http://127.0.0.1:8123".to_string(),
+            user: None,
+            pass: None,
+            enabled: false,
         }
     }
 }
