@@ -127,17 +127,18 @@ pub async fn write_both(
 }
 
 /// Shadow read: execute same query against both backends and compare results.
+/// Note: This is a comparison framework. In production, you'd translate ES queries to SQL
+/// and compare actual result sets, not just row counts.
 pub async fn shadow_read(
     es: &Elastic,
     ck: &ClickHouse,
     index_kind: &str,
+    es_query: Value,
     sql_query: &str,
     counter: &DivergenceCounter,
 ) -> Result<(Value, String, u128, u128)> {
     let es_start = std::time::Instant::now();
-    let es_result = es
-        .search(index_kind, serde_json::json!({"query": {"match_all": {}}, "size": 100}))
-        .await?;
+    let es_result = es.search(index_kind, es_query).await?;
     let es_time = es_start.elapsed();
 
     let ck_start = std::time::Instant::now();
@@ -147,8 +148,8 @@ pub async fn shadow_read(
     // Compare row counts if available
     if let Some(total) = es_result.get("hits").and_then(|h| h.get("total")) {
         if let Some(es_count) = total.get("value").and_then(|v| v.as_u64()) {
-            // Parse ClickHouse result to count rows
-            let ck_count = ck_result.lines().count() as u64;
+            // Parse ClickHouse result to count rows (subtract 1 for header if present)
+            let ck_count = ck_result.lines().filter(|l| !l.trim().is_empty()).count() as u64;
             if es_count != ck_count {
                 tracing::warn!(
                     es_count,

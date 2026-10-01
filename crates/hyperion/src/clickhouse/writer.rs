@@ -221,7 +221,7 @@ fn token_row(doc: &Doc, version: u64) -> Result<Vec<String>> {
 
 /// Batch of rows to be inserted into ClickHouse, organized by table.
 pub struct ClickHouseBatch {
-    pub rows_by_table: HashMap<&'static str, Vec<Vec<String>>>,
+    pub rows_by_table: HashMap<String, Vec<Vec<String>>>,
     pub max_block: u32,
     pub count: usize,
 }
@@ -240,7 +240,7 @@ impl ClickHouseBatch {
         let block_num = (version >> 32) as u32;
 
         self.rows_by_table
-            .entry(doc.kind)
+            .entry(doc.kind.to_string())
             .or_insert_with(Vec::new)
             .push(row);
 
@@ -291,6 +291,17 @@ pub async fn write_batches(
             continue;
         }
         if closed && jobs.is_empty() {
+            // Process any remaining queued results before exit (ensure no lost checkpoints)
+            while let Some((max_block, result)) = ready.remove(&completed) {
+                result?;
+                completed += 1;
+                if max_block > checkpoint {
+                    checkpoint = max_block;
+                    let version = ((checkpoint as u64) << 32) | 0;
+                    ck.set_checkpoint(checkpoint, version).await?;
+                    tracing::debug!(checkpoint, "advanced final checkpoint");
+                }
+            }
             return Ok(());
         }
 
