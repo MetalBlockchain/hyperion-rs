@@ -10,6 +10,29 @@ impl SymbolCode {
     pub fn from_u64(v: u64) -> Self {
         SymbolCode(v)
     }
+
+    /// Convert a packed symbol code while rejecting non-ASCII/non-uppercase
+    /// bytes instead of letting `Display::to_string()` panic on invalid UTF-8.
+    pub fn try_to_string(&self) -> crate::Result<String> {
+        let mut value = self.0;
+        let mut output = String::new();
+        let mut ended = false;
+        while value > 0 {
+            let byte = (value & 0xff) as u8;
+            value >>= 8;
+            if byte == 0 {
+                ended = true;
+            } else if ended || !byte.is_ascii_uppercase() {
+                return Err(AntelopeError::BadSymbol(format!(
+                    "invalid packed symbol code 0x{:016x}",
+                    self.0
+                )));
+            } else {
+                output.push(char::from(byte));
+            }
+        }
+        Ok(output)
+    }
 }
 
 impl fmt::Display for SymbolCode {
@@ -58,6 +81,10 @@ impl Symbol {
     pub fn code(&self) -> SymbolCode {
         SymbolCode(self.0 >> 8)
     }
+
+    pub fn try_to_string(&self) -> crate::Result<String> {
+        Ok(format!("{},{}", self.precision(), self.code().try_to_string()?))
+    }
 }
 
 impl fmt::Display for Symbol {
@@ -97,6 +124,25 @@ impl Asset {
     /// acceptable here: the exact string form is preserved separately.
     pub fn to_f64(&self) -> f64 {
         self.amount as f64 / 10f64.powi(self.symbol.precision() as i32)
+    }
+
+    pub fn try_to_string(&self) -> crate::Result<String> {
+        let code = self.symbol.code().try_to_string()?;
+        let precision = self.symbol.precision() as usize;
+        let negative = self.amount < 0;
+        let abs = self.amount.unsigned_abs();
+        let sign = if negative { "-" } else { "" };
+        if precision == 0 {
+            return Ok(format!("{sign}{abs} {code}"));
+        }
+        match 10u64.checked_pow(precision as u32) {
+            Some(divisor) => Ok(format!(
+                "{sign}{}.{:0precision$} {code}",
+                abs / divisor,
+                abs % divisor
+            )),
+            None => Ok(format!("{sign}{abs} {code}")),
+        }
     }
 }
 
