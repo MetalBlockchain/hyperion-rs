@@ -307,7 +307,9 @@ fn perm_row(doc: &Doc, version: u64) -> Result<Vec<String>> {
 /// ReplacingMergeTree discards the rest of this row's columns once it
 /// resolves `is_deleted`, but the API layer must still filter it explicitly
 /// (`WHERE is_deleted = 0`) since `FINAL` alone only picks the latest
-/// version, not "the latest version that isn't a tombstone".
+/// version, not "the latest version that isn't a tombstone". `last_updated`
+/// is non-null in ClickHouse, so tombstones use the epoch as a placeholder;
+/// the version column alone controls replacement order.
 fn perm_tombstone_row(doc: &Doc, version: u64) -> Result<Vec<String>> {
     let id = doc
         .id
@@ -321,7 +323,7 @@ fn perm_tombstone_row(doc: &Doc, version: u64) -> Result<Vec<String>> {
         escape_tab_separated(owner),
         escape_tab_separated(name),
         String::new(),
-        String::new(),
+        "1970-01-01 00:00:00.000".to_string(),
         array_to_string(&[]),
         array_to_string(&[]),
         "0".to_string(),
