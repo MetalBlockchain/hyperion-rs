@@ -420,10 +420,23 @@ impl ClickHouseBatch {
             None => return String::new(),
         };
 
-        rows.iter()
-            .map(|fields| fields.join("\t"))
-            .collect::<Vec<_>>()
-            .join("\n")
+        let capacity = rows
+            .iter()
+            .map(|fields| fields.iter().map(String::len).sum::<usize>() + fields.len())
+            .sum();
+        let mut data = String::with_capacity(capacity);
+        for (row_index, fields) in rows.iter().enumerate() {
+            if row_index > 0 {
+                data.push('\n');
+            }
+            for (field_index, field) in fields.iter().enumerate() {
+                if field_index > 0 {
+                    data.push('\t');
+                }
+                data.push_str(field);
+            }
+        }
+        data
     }
 }
 
