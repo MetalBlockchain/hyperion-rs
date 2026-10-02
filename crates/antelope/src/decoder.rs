@@ -217,19 +217,19 @@ impl<'a> AbiDecoder<'a> {
             "checksum512" => json!(hex::encode(r.read_exact(64)?)),
             "public_key" => json!(keys::read_public_key(r)?),
             "signature" => json!(keys::read_signature(r)?),
-            "symbol" => json!(Symbol(r.read_u64()?).to_string()),
-            "symbol_code" => json!(SymbolCode(r.read_u64()?).to_string()),
+            "symbol" => json!(Symbol(r.read_u64()?).try_to_string()?),
+            "symbol_code" => json!(SymbolCode(r.read_u64()?).try_to_string()?),
             "asset" => {
                 let amount = r.read_i64()?;
                 let symbol = Symbol(r.read_u64()?);
-                json!(Asset::new(amount, symbol).to_string())
+                json!(Asset::new(amount, symbol).try_to_string()?)
             }
             "extended_asset" => {
                 let amount = r.read_i64()?;
                 let symbol = Symbol(r.read_u64()?);
                 let contract = r.read_name()?;
                 json!({
-                    "quantity": Asset::new(amount, symbol).to_string(),
+                    "quantity": Asset::new(amount, symbol).try_to_string()?,
                     "contract": contract.to_string(),
                 })
             }

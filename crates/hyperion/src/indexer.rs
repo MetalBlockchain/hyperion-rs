@@ -1,17 +1,16 @@
 //! The indexing pipeline: SHIP reader → parallel raw decoders → ordered
-//! processor → Elasticsearch bulk writer. Hyperion uses RabbitMQ between
+//! processor → ClickHouse batch writer. Hyperion uses RabbitMQ between
 //! these stages; here they are
 //! in-process tasks connected by bounded channels, with SHIP's own
 //! credit-based flow control providing end-to-end backpressure.
 
 use crate::abis::AbiCache;
+use crate::clickhouse::{ClickHouse, ClickHouseBatch};
 use crate::config::Config;
-use crate::elastic::{index_definitions, Elastic};
-use crate::processor::{DecodedBlock, Doc, Op, Processor};
+use crate::processor::{DecodedBlock, Processor};
 use anyhow::{Context, Result};
-use serde::Serialize;
 use ship::{GetBlocksRequest, GetBlocksResult, ShipClient, ShipResult};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
@@ -23,24 +22,21 @@ pub async fn run(config: Config) -> Result<()> {
     );
     anyhow::ensure!(config.indexer.batch_size > 0, "batch_size must be positive");
     anyhow::ensure!(
-        config.indexer.batch_max_bytes > 0,
-        "batch_max_bytes must be positive"
-    );
-    anyhow::ensure!(
         config.indexer.flush_interval_ms > 0,
         "flush_interval_ms must be positive"
     );
-    let es = Elastic::new(&config.elasticsearch);
-    let info = es.ping().await.context("cannot reach elasticsearch")?;
-    tracing::info!(version = %info["version"]["number"], "connected to elasticsearch");
+    let ck = ClickHouse::new(
+        config.clickhouse.url.clone(),
+        config.clickhouse.user.clone(),
+        config.clickhouse.pass.clone(),
+    );
+    ck.ping().await.context("cannot reach clickhouse")?;
+    ck.create_all()
+        .await
+        .context("cannot create clickhouse tables")?;
+    tracing::info!(url = %config.clickhouse.url, "connected to clickhouse");
 
-    for (kind, body) in
-        index_definitions(config.elasticsearch.shards, config.elasticsearch.replicas)
-    {
-        es.create_index(&config.index(kind), body).await?;
-    }
-
-    let start_block = resolve_start_block(&config, &es).await?;
+    let start_block = resolve_start_block(&config, &ck).await?;
     let stop_block = config.indexer.stop_block;
 
     let mut client = ShipClient::connect(&config.chain.ship)
@@ -66,7 +62,6 @@ pub async fn run(config: Config) -> Result<()> {
     client
         .request_blocks(&GetBlocksRequest {
             start_block_num: start_block,
-            // end_block_num is exclusive.
             end_block_num: if stop_block > 0 {
                 stop_block + 1
             } else {
@@ -81,8 +76,6 @@ pub async fn run(config: Config) -> Result<()> {
         .await?;
     tracing::info!(start_block, stop_block, "requested block stream");
 
-    // Reader task: pull frames off the socket, refill SHIP credit as the
-    // channel accepts each block (bounded channel = backpressure).
     let (tx, rx) = mpsc::channel::<Box<GetBlocksResult>>(
         config.indexer.max_messages_in_flight.max(1) as usize,
     );
@@ -112,13 +105,7 @@ pub async fn run(config: Config) -> Result<()> {
         }
     };
 
-    // Batches queue ahead of the writer so it's never starved between
-    // flushes; the writer itself may run several bulk requests concurrently
-    // (see write_batches) since each document's external version makes
-    // out-of-order completion safe.
     let (batch_tx, batch_rx) = mpsc::channel(2);
-    // JoinSet aborts the remaining stages on error or cancellation, so neither
-    // the socket reader nor pending writes can outlive this indexing run.
     let mut stages = tokio::task::JoinSet::new();
     stages.spawn(reader);
     let input = if config.indexer.decode_workers == 0 {
@@ -134,12 +121,11 @@ pub async fn run(config: Config) -> Result<()> {
         writer_concurrency = config.indexer.writer_concurrency,
         "started indexing pipeline"
     );
-    let progress_index = config.index("progress");
     let writer_concurrency = config.indexer.writer_concurrency;
     stages.spawn(async move { process_blocks(&config, input, batch_tx).await });
-    stages.spawn(
-        async move { write_batches(&es, batch_rx, writer_concurrency, &progress_index).await },
-    );
+    stages.spawn(async move {
+        crate::clickhouse::write_batches(&ck, batch_rx, writer_concurrency).await
+    });
     while let Some(result) = stages.join_next().await {
         result??;
     }
@@ -213,10 +199,15 @@ where
     }
 }
 
+/// `ClickHouseBatch` keys rows by `doc.kind` directly (ClickHouse's table
+/// names match the kinds exactly, see `clickhouse::schema::create_tables_sql`),
+/// so there is no per-kind index name to look up, and it tracks a row count
+/// only - unlike the old Elasticsearch bulk body there is no running
+/// byte-size threshold to check.
 async fn process_blocks(
     config: &Config,
     mut rx: BlockInput,
-    tx: mpsc::Sender<BulkBatch>,
+    tx: mpsc::Sender<ClickHouseBatch>,
 ) -> Result<()> {
     let system_account: antelope::Name = config
         .chain
@@ -225,11 +216,7 @@ async fn process_blocks(
         .map_err(|e| anyhow::anyhow!("bad chain.system_account: {e}"))?;
     let processor = Processor::new(&config.indexer.skip_actions, system_account);
     let mut abis = AbiCache::new(config.chain.client());
-    let indices: HashMap<_, _> = ["action", "block", "delta", "abi", "perm", "token"]
-        .into_iter()
-        .map(|kind| (kind, config.index(kind)))
-        .collect();
-    let mut batch = BulkBatch::default();
+    let mut batch = ClickHouseBatch::new();
     let mut last_flush = Instant::now();
     let mut last_report = Instant::now();
     let mut blocks_since_report = 0u64;
@@ -261,18 +248,13 @@ async fn process_blocks(
 
         let docs = processor.process_decoded(&block, &mut abis).await?;
         for (seq, doc) in docs.into_iter().enumerate() {
-            // High bits = block, low bits = position within the block: always
-            // increases across blocks, and disambiguates multiple updates to
-            // the same entity (e.g. a permission touched twice) within one.
             let version = (u64::from(last_block) << 32) | seq as u64;
-            batch.push(&indices[doc.kind], &doc, version)?;
+            batch.push(&doc, version)?;
         }
         blocks_since_report += 1;
 
         if batch.count > 0
-            && (batch.count >= config.indexer.batch_size
-                || batch.body.len() >= config.indexer.batch_max_bytes
-                || last_flush.elapsed() >= flush_interval)
+            && (batch.count >= config.indexer.batch_size || last_flush.elapsed() >= flush_interval)
         {
             tx.send(std::mem::take(&mut batch)).await?;
             last_flush = Instant::now();
@@ -291,31 +273,31 @@ async fn process_blocks(
     Ok(())
 }
 
-async fn resolve_start_block(config: &Config, es: &Elastic) -> Result<u32> {
+async fn resolve_start_block(config: &Config, ck: &ClickHouse) -> Result<u32> {
     if config.indexer.start_block > 0 {
         return Ok(config.indexer.start_block);
     }
     // The checkpoint only advances once batches complete contiguously (see
-    // write_batches), so it's safe to trust even though writes themselves
-    // may complete out of order. Prefer it over the raw aggregation below,
-    // which can't tell "durably confirmed" apart from "visible but a lower
-    // block is still in flight or failed".
-    if let Some(checkpoint) = es.get_checkpoint(&config.index("progress")).await? {
+    // clickhouse::writer::write_batches), so it's safe to trust even though
+    // writes themselves may complete out of order. Prefer it over the raw
+    // aggregation below, which can't tell "durably confirmed" apart from
+    // "visible but a lower block is still in flight or failed".
+    if let Some(checkpoint) = ck.get_checkpoint().await? {
         tracing::info!(
             resume_from = checkpoint + 1,
-            index = "progress",
+            table = "progress",
             "resuming from last confirmed checkpoint"
         );
         return Ok(checkpoint + 1);
     }
-    // Deployments predating the checkpoint doc: fall back to the highest
-    // indexed block; block index first, actions as fallback for deployments
+    // Deployments predating the checkpoint row: fall back to the highest
+    // indexed block; block table first, actions as fallback for deployments
     // that disable fetch_block.
     for kind in ["block", "action"] {
-        if let Some(max) = es.max_block_num(&config.index(kind)).await? {
+        if let Some(max) = ck.max_block_num(kind).await? {
             tracing::info!(
                 resume_from = max + 1,
-                index = kind,
+                table = kind,
                 "resuming from last indexed block"
             );
             return Ok(max + 1);
@@ -324,138 +306,9 @@ async fn resolve_start_block(config: &Config, es: &Elastic) -> Result<u32> {
     Ok(1)
 }
 
-#[derive(Default)]
-struct BulkBatch {
-    body: Vec<u8>,
-    count: usize,
-    /// Highest block any document in this batch belongs to, so the writer
-    /// can advance the resume checkpoint once the batch is durably written.
-    max_block: u32,
-}
-
-#[derive(Serialize)]
-struct BulkMetadata<'a> {
-    #[serde(rename = "_index")]
-    index: &'a str,
-    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
-    id: Option<&'a str>,
-    version_type: &'static str,
-    version: u64,
-}
-
-impl BulkBatch {
-    /// `version`'s high 32 bits are the document's block number (see the
-    /// call site in `process_blocks`), used both as Elasticsearch's external
-    /// version — so a write that arrives out of order is rejected rather
-    /// than silently overwriting a newer document — and to track how far
-    /// this batch's content reaches for the resume checkpoint.
-    fn push(&mut self, index: &str, doc: &Doc, version: u64) -> Result<()> {
-        let meta = BulkMetadata {
-            index,
-            id: doc.id.as_deref(),
-            version_type: "external",
-            version,
-        };
-        match doc.op {
-            Op::Index => {
-                self.body.extend_from_slice(b"{\"index\":");
-                serde_json::to_writer(&mut self.body, &meta)?;
-                self.body.extend_from_slice(b"}\n");
-                serde_json::to_writer(&mut self.body, &doc.body)?;
-                self.body.push(b'\n');
-            }
-            Op::Delete => {
-                anyhow::ensure!(meta.id.is_some(), "delete requires a document ID");
-                self.body.extend_from_slice(b"{\"delete\":");
-                serde_json::to_writer(&mut self.body, &meta)?;
-                self.body.extend_from_slice(b"}\n");
-            }
-        }
-        self.count += 1;
-        self.max_block = self.max_block.max((version >> 32) as u32);
-        Ok(())
-    }
-}
-
-/// Runs up to `concurrency` bulk requests at once. Each document's external
-/// version (`BulkBatch::push`) makes out-of-order completion safe at the
-/// Elasticsearch level, but batches are still confirmed in submission order
-/// here so `progress_index`'s checkpoint never advances past one that's
-/// still in flight or that failed — even though a later batch may already
-/// have landed on the wire by the time an earlier one is confirmed.
-async fn write_batches(
-    es: &Elastic,
-    mut rx: mpsc::Receiver<BulkBatch>,
-    concurrency: usize,
-    progress_index: &str,
-) -> Result<()> {
-    anyhow::ensure!(concurrency > 0, "writer_concurrency must be at least 1");
-    let mut jobs = tokio::task::JoinSet::new();
-    let mut ready: BTreeMap<u64, (u32, Result<()>)> = BTreeMap::new();
-    let mut submitted = 0u64;
-    let mut completed = 0u64;
-    let mut checkpoint = 0u32;
-    let mut closed = false;
-    loop {
-        if let Some((max_block, result)) = ready.remove(&completed) {
-            result?;
-            completed += 1;
-            if max_block > checkpoint {
-                checkpoint = max_block;
-                es.set_checkpoint(progress_index, checkpoint).await?;
-            }
-            continue;
-        }
-        if closed && jobs.is_empty() {
-            return Ok(());
-        }
-        tokio::select! {
-            batch = rx.recv(), if !closed && jobs.len() + ready.len() < concurrency => {
-                match batch {
-                    Some(batch) => {
-                        let ordinal = submitted;
-                        submitted += 1;
-                        let max_block = batch.max_block;
-                        let count = batch.count;
-                        let bytes = batch.body.len();
-                        let es = es.clone();
-                        jobs.spawn(async move {
-                            let started = Instant::now();
-                            let result = es.bulk(batch.body).await.and_then(|failed| {
-                                anyhow::ensure!(
-                                    failed == 0,
-                                    "bulk indexing failed for {failed} of {count} documents"
-                                );
-                                Ok(())
-                            });
-                            if result.is_ok() {
-                                tracing::debug!(
-                                    count,
-                                    bytes,
-                                    elapsed_ms = started.elapsed().as_millis(),
-                                    "flushed batch"
-                                );
-                            }
-                            (ordinal, max_block, result)
-                        });
-                    }
-                    None => closed = true,
-                }
-            }
-            result = jobs.join_next(), if !jobs.is_empty() => {
-                let (ordinal, max_block, result) = result
-                    .expect("nonempty writer jobs")
-                    .context("bulk writer task failed")?;
-                ready.insert(ordinal, (max_block, result));
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::{json, Value};
 
     fn block(number: u32) -> Box<GetBlocksResult> {
         // Empty signed block: fixed header, no producer schedule or header
@@ -614,164 +467,119 @@ mod tests {
         assert!(output.recv().await.is_none());
     }
 
-    #[tokio::test]
-    async fn writer_stops_before_submitting_queued_batches_after_failure() {
-        use std::sync::{
-            atomic::{AtomicUsize, Ordering},
-            Arc,
-        };
-        let requests = Arc::new(AtomicUsize::new(0));
-        let counter = requests.clone();
-        let app = axum::Router::new().route(
-            "/_bulk",
-            axum::routing::post(move || {
-                counter.fetch_add(1, Ordering::SeqCst);
-                async {
-                    axum::Json(json!({"errors": true, "items": [
-                        {"index": {"status": 429, "error": {"type": "rejected"}}}
-                    ]}))
+    /// Minimal mock of ClickHouse's HTTP interface: `POST /` is an insert
+    /// (TabSeparated body; fails when the body starts with `fail`), `GET /`
+    /// is every other statement run through `query()`/`execute()` (here,
+    /// just the checkpoint `INSERT INTO progress ... VALUES (...)`, counted
+    /// via the `query` parameter text since it's a GET, not a POST).
+    fn mock_clickhouse(
+        insert_requests: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        checkpoint_puts: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) -> axum::Router {
+        use axum::extract::Query;
+        use std::collections::HashMap;
+        use std::sync::atomic::Ordering;
+
+        axum::Router::new().route(
+            "/",
+            axum::routing::get(move |Query(params): Query<HashMap<String, String>>| {
+                let checkpoint_puts = checkpoint_puts.clone();
+                async move {
+                    if params
+                        .get("query")
+                        .is_some_and(|q| q.contains("INSERT INTO progress"))
+                    {
+                        checkpoint_puts.fetch_add(1, Ordering::SeqCst);
+                    }
+                    ""
+                }
+            })
+            .post(move |body: axum::body::Bytes| {
+                let insert_requests = insert_requests.clone();
+                async move {
+                    insert_requests.fetch_add(1, Ordering::SeqCst);
+                    if body.starts_with(b"fail") {
+                        (
+                            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                            "injected failure",
+                        )
+                    } else {
+                        (axum::http::StatusCode::OK, "")
+                    }
                 }
             }),
-        );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mut config = config();
-        config.elasticsearch.url = format!("http://{}", listener.local_addr().unwrap());
-        let mut servers = tokio::task::JoinSet::new();
-        servers.spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let (tx, rx) = mpsc::channel(2);
-        for i in 0..2 {
-            tx.send(BulkBatch {
-                count: 1,
-                body: b"{}\n".to_vec(),
-                max_block: i + 1,
-            })
-            .await
-            .unwrap();
-        }
-        drop(tx);
-        // concurrency = 1 reproduces the old fully-serial writer: the second
-        // batch must never even be submitted once the first has failed.
-        let error = write_batches(
-            &Elastic::new(&config.elasticsearch),
-            rx,
-            1,
-            "unused-progress",
         )
-        .await
-        .unwrap_err();
-        assert!(error.to_string().contains("bulk indexing failed"));
-        assert_eq!(requests.load(Ordering::SeqCst), 1);
+    }
+
+    fn failing_batch(marker: &str, max_block: u32) -> ClickHouseBatch {
+        let mut rows_by_table = std::collections::HashMap::new();
+        rows_by_table.insert("action".to_string(), vec![vec![marker.to_string()]]);
+        ClickHouseBatch {
+            rows_by_table,
+            max_block,
+            count: 1,
+        }
     }
 
     #[tokio::test]
-    async fn checkpoint_never_advances_past_a_failed_batch_even_if_a_later_one_lands_first() {
-        use std::sync::{
-            atomic::{AtomicUsize, Ordering},
-            Arc,
-        };
+    async fn clickhouse_writer_stops_before_submitting_queued_batches_after_failure() {
+        use std::sync::{atomic::AtomicUsize, Arc};
+        let insert_requests = Arc::new(AtomicUsize::new(0));
         let checkpoint_puts = Arc::new(AtomicUsize::new(0));
-        let puts = checkpoint_puts.clone();
-        let app = axum::Router::new()
-            .route(
-                "/_bulk",
-                axum::routing::post(|body: axum::body::Bytes| async move {
-                    if body.starts_with(b"fail") {
-                        axum::Json(json!({"errors": true, "items": [
-                            {"index": {"status": 429, "error": {"type": "rejected"}}}
-                        ]}))
-                    } else {
-                        axum::Json(json!({"errors": false}))
-                    }
-                }),
-            )
-            .route(
-                "/progress-index/_doc/checkpoint",
-                axum::routing::put(move || {
-                    puts.fetch_add(1, Ordering::SeqCst);
-                    async { axum::Json(json!({"result": "updated"})) }
-                }),
-            );
+        let app = mock_clickhouse(insert_requests.clone(), checkpoint_puts);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mut config = config();
-        config.elasticsearch.url = format!("http://{}", listener.local_addr().unwrap());
+        let addr = listener.local_addr().unwrap();
         let mut servers = tokio::task::JoinSet::new();
         servers.spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let ck = ClickHouse::new(format!("http://{addr}"), None, None);
         let (tx, rx) = mpsc::channel(2);
-        // Ordinal 0 fails, ordinal 1 (a later block) would succeed on its
-        // own — with concurrency > 1 both are in flight before either
-        // completes, so ordinal 1 may well land on the wire first.
-        tx.send(BulkBatch {
-            count: 1,
-            body: b"fail\n".to_vec(),
-            max_block: 1,
-        })
-        .await
-        .unwrap();
-        tx.send(BulkBatch {
-            count: 1,
-            body: b"ok\n".to_vec(),
-            max_block: 2,
-        })
-        .await
-        .unwrap();
+        tx.send(failing_batch("fail", 1)).await.unwrap();
+        tx.send(failing_batch("fail", 2)).await.unwrap();
         drop(tx);
-        let error = write_batches(
-            &Elastic::new(&config.elasticsearch),
-            rx,
-            4,
-            "progress-index",
-        )
-        .await
-        .unwrap_err();
-        assert!(error.to_string().contains("bulk indexing failed"));
-        assert_eq!(
-            checkpoint_puts.load(Ordering::SeqCst),
-            0,
-            "checkpoint must not advance while an earlier batch is unresolved or failed"
+        // concurrency = 1 reproduces a fully-serial writer: the second batch
+        // must never even be submitted once the first has failed.
+        let error = crate::clickhouse::write_batches(&ck, rx, 1)
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("clickhouse insert failed"),
+            "{error}"
         );
+        assert_eq!(insert_requests.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
-    #[test]
-    fn serializes_index_and_delete_operations_with_escaped_metadata() {
-        let mut batch = BulkBatch::default();
-        let mut doc = Doc {
-            kind: "action",
-            id: Some("quoted\"id\n".into()),
-            body: json!({"memo": "line one\nline two", "value": 42}),
-            op: Op::Index,
-        };
-        batch.push("test-action", &doc, 7).unwrap();
-        doc.id = None;
-        batch.push("test-action", &doc, 7).unwrap();
-        doc.op = Op::Delete;
-        doc.id = Some("balance".into());
-        batch.push("test-token", &doc, (2u64 << 32) | 1).unwrap();
-        assert_eq!(batch.count, 3);
-        assert_eq!(batch.max_block, 2);
-        assert!(batch.body.ends_with(b"\n"));
-        let body = String::from_utf8(batch.body).unwrap();
-        let lines: Vec<Value> = body
-            .lines()
-            .map(|line| serde_json::from_str(line).unwrap())
-            .collect();
+    #[tokio::test]
+    async fn clickhouse_checkpoint_never_advances_past_a_failed_batch_even_if_a_later_one_lands_first(
+    ) {
+        use std::sync::{atomic::AtomicUsize, Arc};
+        let insert_requests = Arc::new(AtomicUsize::new(0));
+        let checkpoint_puts = Arc::new(AtomicUsize::new(0));
+        let app = mock_clickhouse(insert_requests, checkpoint_puts.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut servers = tokio::task::JoinSet::new();
+        servers.spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let ck = ClickHouse::new(format!("http://{addr}"), None, None);
+        let (tx, rx) = mpsc::channel(2);
+        // Ordinal 0 fails, ordinal 1 (a later block) would succeed on its own
+        // - with concurrency > 1 both are in flight before either completes,
+        // so ordinal 1 may well land on the wire first.
+        tx.send(failing_batch("fail", 1)).await.unwrap();
+        tx.send(failing_batch("ok", 2)).await.unwrap();
+        drop(tx);
+        let error = crate::clickhouse::write_batches(&ck, rx, 4)
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("clickhouse insert failed"),
+            "{error}"
+        );
         assert_eq!(
-            lines,
-            vec![
-                json!({
-                    "index": {"_index": "test-action", "_id": "quoted\"id\n",
-                              "version_type": "external", "version": 7}
-                }),
-                doc.body.clone(),
-                json!({
-                    "index": {"_index": "test-action",
-                              "version_type": "external", "version": 7}
-                }),
-                doc.body,
-                json!({
-                    "delete": {"_index": "test-token", "_id": "balance",
-                               "version_type": "external", "version": (2u64 << 32) | 1}
-                }),
-            ]
+            checkpoint_puts.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "checkpoint must not advance while an earlier batch is unresolved or failed"
         );
     }
 }

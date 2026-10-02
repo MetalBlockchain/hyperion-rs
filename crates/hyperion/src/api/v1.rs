@@ -1,7 +1,7 @@
 //! Minimal nodeos history-plugin (v1) compatibility layer, translating onto
-//! the same Elasticsearch indices as the v2 API.
+//! the same ClickHouse tables as the v2 API.
 
-use super::{search_sources, ApiError, ApiResult, Shared};
+use super::{query_rows, ApiError, ApiResult, Shared};
 use axum::extract::State;
 use axum::Json;
 use serde::Deserialize;
@@ -27,13 +27,22 @@ pub async fn get_actions(
     } else {
         (pos as usize, offset.clamp(1, 1000) as usize, "asc")
     };
-    let body = json!({
-        "from": from,
-        "size": size,
-        "query": {"bool": {"filter": [{"term": {"notified": params.account_name}}]}},
-        "sort": [{"global_sequence": {"order": order}}],
-    });
-    let (mut hits, _, _) = search_sources(&state, "action", body).await?;
+    let sql = crate::clickhouse::build_get_actions_query(
+        Some(&params.account_name),
+        None,
+        from,
+        size,
+        order,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .map_err(ApiError::internal)?;
+    let (rows, _) = query_rows(&state, &sql).await?;
+    let mut hits: Vec<Value> = rows.iter().map(crate::clickhouse::action_doc).collect();
     if order == "desc" {
         hits.reverse();
     }
@@ -72,12 +81,10 @@ pub async fn get_transaction(
     State(state): State<Shared>,
     Json(params): Json<V1GetTransaction>,
 ) -> ApiResult {
-    let body = json!({
-        "size": 1000,
-        "query": {"bool": {"filter": [{"term": {"trx_id": params.id.to_lowercase()}}]}},
-        "sort": [{"global_sequence": {"order": "asc"}}],
-    });
-    let (hits, _, _) = search_sources(&state, "action", body).await?;
+    let sql = crate::clickhouse::build_get_transaction_query(&params.id.to_lowercase())
+        .map_err(ApiError::internal)?;
+    let (rows, _) = query_rows(&state, &sql).await?;
+    let hits: Vec<Value> = rows.iter().map(crate::clickhouse::action_doc).collect();
     if hits.is_empty() {
         return Err(ApiError(
             axum::http::StatusCode::NOT_FOUND,
@@ -117,12 +124,9 @@ pub async fn get_key_accounts(
     Json(params): Json<V1GetKeyAccounts>,
 ) -> ApiResult {
     let key = antelope::keys::normalize_public_key(params.public_key.trim());
-    let body = json!({
-        "size": 1000,
-        "query": {"bool": {"filter": [{"term": {"keys": key}}]}},
-        "sort": [{"owner": {"order": "asc"}}],
-    });
-    let (hits, _, _) = search_sources(&state, "perm", body).await?;
+    let sql = crate::clickhouse::build_get_key_accounts_query(&key, 0, 1000)
+        .map_err(ApiError::internal)?;
+    let (hits, _) = query_rows(&state, &sql).await?;
     let mut account_names: Vec<&str> = hits.iter().filter_map(|p| p["owner"].as_str()).collect();
     account_names.dedup();
     Ok(Json(json!({"account_names": account_names})))
@@ -137,15 +141,9 @@ pub async fn get_controlled_accounts(
     State(state): State<Shared>,
     Json(params): Json<V1GetControlledAccounts>,
 ) -> ApiResult {
-    // `accounts` entries are stored as `actor@permission`.
-    let body = json!({
-        "size": 1000,
-        "query": {"bool": {"filter": [
-            {"prefix": {"accounts": format!("{}@", params.controlling_account)}}
-        ]}},
-        "sort": [{"owner": {"order": "asc"}}],
-    });
-    let (hits, _, _) = search_sources(&state, "perm", body).await?;
+    let sql = crate::clickhouse::build_get_controlled_accounts_query(&params.controlling_account)
+        .map_err(ApiError::internal)?;
+    let (hits, _) = query_rows(&state, &sql).await?;
     let mut account_names: Vec<&str> = hits.iter().filter_map(|p| p["owner"].as_str()).collect();
     account_names.dedup();
     Ok(Json(json!({"controlled_accounts": account_names})))

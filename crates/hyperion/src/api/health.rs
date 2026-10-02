@@ -8,21 +8,20 @@ pub async fn health(State(state): State<Shared>) -> ApiResult {
     let mut services = Vec::new();
 
     let started = Instant::now();
-    let es_status = match state.es.ping().await {
-        Ok(info) => json!({
-            "service": "Elasticsearch",
+    let ch_status = match state.ck.ping().await {
+        Ok(()) => json!({
+            "service": "ClickHouse",
             "status": "OK",
-            "service_data": {"version": info["version"]["number"]},
             "time": started.elapsed().as_millis() as u64,
         }),
         Err(e) => json!({
-            "service": "Elasticsearch",
+            "service": "ClickHouse",
             "status": "Error",
             "service_data": {"error": e.to_string()},
             "time": started.elapsed().as_millis() as u64,
         }),
     };
-    services.push(es_status);
+    services.push(ch_status);
 
     let started = Instant::now();
     let service = state.chain.service_name();
@@ -44,8 +43,8 @@ pub async fn health(State(state): State<Shared>) -> ApiResult {
     services.push(nodeos_status);
 
     let last_indexed = state
-        .es
-        .max_block_num(&state.config.index("block"))
+        .ck
+        .max_block_num("block")
         .await
         .ok()
         .flatten()

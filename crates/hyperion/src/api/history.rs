@@ -1,4 +1,4 @@
-use super::{clamp_limit, range_filters, search_sources, ApiError, ApiResult, Shared};
+use super::{clamp_limit, parse_block_bound, query_rows, ApiError, ApiResult, Shared};
 use axum::extract::{Query, State};
 use axum::Json;
 use serde::Deserialize;
@@ -29,71 +29,59 @@ pub struct GetActionsParams {
     pub transfer_memo: Option<String>,
 }
 
-fn filter_clause(filter: &str) -> Result<Value, ApiError> {
-    let mut should = Vec::new();
-    for pair in filter.split(',') {
-        let (code, action) = pair
-            .split_once(':')
-            .ok_or_else(|| ApiError::bad_request(format!("bad filter entry: {pair}")))?;
-        let mut must = Vec::new();
-        if code != "*" {
-            must.push(json!({"term": {"act.account": code}}));
-        }
-        if action != "*" {
-            must.push(json!({"term": {"act.name": action}}));
-        }
-        should.push(json!({"bool": {"must": must}}));
-    }
-    Ok(json!({"bool": {"should": should, "minimum_should_match": 1}}))
-}
-
 pub async fn get_actions(
     State(state): State<Shared>,
     Query(params): Query<GetActionsParams>,
 ) -> ApiResult {
-    let mut filters = Vec::new();
-    if let Some(account) = &params.account {
-        filters.push(json!({"term": {"notified": account}}));
-    }
-    if let Some(filter) = &params.filter {
-        filters.push(filter_clause(filter)?);
-    }
-    for (field, value) in [
-        ("@transfer.from", &params.transfer_from),
-        ("@transfer.to", &params.transfer_to),
-        ("@transfer.symbol", &params.transfer_symbol),
-    ] {
-        if let Some(value) = value {
-            filters.push(json!({"term": {field: value}}));
-        }
-    }
-    if let Some(memo) = &params.transfer_memo {
-        filters.push(json!({"match": {"@transfer.memo": memo}}));
-    }
-    filters.extend(range_filters(
-        params.after.as_deref(),
-        params.before.as_deref(),
-    ));
-
     let sort_dir = match params.sort.as_deref() {
         None | Some("desc") => "desc",
         Some("asc") => "asc",
         Some(other) => return Err(ApiError::bad_request(format!("bad sort: {other}"))),
     };
-    // track=false counts up to ES's 10k cap (cheap); track=true is exact.
-    let track: Value = if params.track.as_deref() == Some("true") {
-        json!(true)
+    let after = params.after.as_deref().map(parse_block_bound).transpose()?;
+    let before = params
+        .before
+        .as_deref()
+        .map(parse_block_bound)
+        .transpose()?;
+    let skip = params.skip.unwrap_or(0);
+    let limit = clamp_limit(&state, params.limit);
+
+    let sql = crate::clickhouse::build_get_actions_query(
+        params.account.as_deref(),
+        params.filter.as_deref(),
+        skip,
+        limit,
+        sort_dir,
+        after,
+        before,
+        params.transfer_from.as_deref(),
+        params.transfer_to.as_deref(),
+        params.transfer_symbol.as_deref(),
+        params.transfer_memo.as_deref(),
+    )
+    .map_err(ApiError::internal)?;
+    let (rows, took) = query_rows(&state, &sql).await?;
+    let mut actions: Vec<Value> = rows.iter().map(crate::clickhouse::action_doc).collect();
+
+    let total = if params.track.as_deref() == Some("true") {
+        let count_sql = crate::clickhouse::build_get_actions_with_count_query(
+            params.account.as_deref(),
+            params.filter.as_deref(),
+            params.transfer_from.as_deref(),
+            params.transfer_to.as_deref(),
+            params.transfer_symbol.as_deref(),
+            params.transfer_memo.as_deref(),
+        )
+        .map_err(ApiError::internal)?;
+        let (count_rows, _) = query_rows(&state, &count_sql).await?;
+        count_rows
+            .first()
+            .map(|r| r["total"].clone())
+            .unwrap_or(json!(0))
     } else {
-        json!(10000)
+        json!(actions.len())
     };
-    let body = json!({
-        "track_total_hits": track,
-        "from": params.skip.unwrap_or(0),
-        "size": clamp_limit(&state, params.limit),
-        "query": {"bool": {"filter": filters}},
-        "sort": [{"global_sequence": {"order": sort_dir}}],
-    });
-    let (mut actions, total, took) = search_sources(&state, "action", body).await?;
 
     for action in &mut actions {
         if let Some(ts) = action.get("@timestamp").cloned() {
@@ -136,12 +124,10 @@ pub async fn get_transaction(
     State(state): State<Shared>,
     Query(params): Query<GetTransactionParams>,
 ) -> ApiResult {
-    let body = json!({
-        "size": 1000,
-        "query": {"bool": {"filter": [{"term": {"trx_id": params.id.to_lowercase()}}]}},
-        "sort": [{"global_sequence": {"order": "asc"}}],
-    });
-    let (mut actions, _, took) = search_sources(&state, "action", body).await?;
+    let sql = crate::clickhouse::build_get_transaction_query(&params.id.to_lowercase())
+        .map_err(ApiError::internal)?;
+    let (rows, took) = query_rows(&state, &sql).await?;
+    let mut actions: Vec<Value> = rows.iter().map(crate::clickhouse::action_doc).collect();
     for action in &mut actions {
         if let Some(ts) = action.get("@timestamp").cloned() {
             action["timestamp"] = ts;
@@ -174,37 +160,49 @@ pub async fn get_deltas(
     State(state): State<Shared>,
     Query(params): Query<GetDeltasParams>,
 ) -> ApiResult {
-    let mut filters = Vec::new();
-    for (field, value) in [
-        ("code", &params.code),
-        ("scope", &params.scope),
-        ("table", &params.table),
-        ("payer", &params.payer),
-    ] {
-        if let Some(value) = value {
-            filters.push(json!({"term": {field: value}}));
-        }
-    }
-    if let Some(present) = params.present {
-        filters.push(json!({"term": {"present": present}}));
-    }
-    filters.extend(range_filters(
-        params.after.as_deref(),
-        params.before.as_deref(),
-    ));
-
     let sort_dir = if params.sort.as_deref() == Some("asc") {
         "asc"
     } else {
         "desc"
     };
-    let body = json!({
-        "from": params.skip.unwrap_or(0),
-        "size": clamp_limit(&state, params.limit),
-        "query": {"bool": {"filter": filters}},
-        "sort": [{"block_num": {"order": sort_dir}}],
-    });
-    let (deltas, total, took) = search_sources(&state, "delta", body).await?;
+    let after = params.after.as_deref().map(parse_block_bound).transpose()?;
+    let before = params
+        .before
+        .as_deref()
+        .map(parse_block_bound)
+        .transpose()?;
+    let skip = params.skip.unwrap_or(0);
+    let limit = clamp_limit(&state, params.limit);
+
+    let sql = crate::clickhouse::build_get_deltas_query(
+        params.code.as_deref(),
+        params.scope.as_deref(),
+        params.table.as_deref(),
+        params.payer.as_deref(),
+        params.present,
+        after,
+        before,
+        skip,
+        limit,
+        sort_dir,
+    )
+    .map_err(ApiError::internal)?;
+    let count_sql = crate::clickhouse::build_get_deltas_count_query(
+        params.code.as_deref(),
+        params.scope.as_deref(),
+        params.table.as_deref(),
+        params.payer.as_deref(),
+        params.present,
+        after,
+        before,
+    )
+    .map_err(ApiError::internal)?;
+    let (deltas, took) = query_rows(&state, &sql).await?;
+    let (count_rows, _) = query_rows(&state, &count_sql).await?;
+    let total = count_rows
+        .first()
+        .map(|r| r["total"].clone())
+        .unwrap_or(json!(0));
     Ok(Json(json!({
         "query_time_ms": took,
         "total": total,
@@ -222,16 +220,9 @@ pub async fn get_abi_snapshot(
     State(state): State<Shared>,
     Query(params): Query<AbiSnapshotParams>,
 ) -> ApiResult {
-    let mut filters = vec![json!({"term": {"account": params.contract}})];
-    if let Some(block) = params.block {
-        filters.push(json!({"range": {"block_num": {"lte": block}}}));
-    }
-    let body = json!({
-        "size": 1,
-        "query": {"bool": {"filter": filters}},
-        "sort": [{"block_num": {"order": "desc"}}],
-    });
-    let (hits, _, took) = search_sources(&state, "abi", body).await?;
+    let sql = crate::clickhouse::build_get_abi_snapshot_query(&params.contract, params.block)
+        .map_err(ApiError::internal)?;
+    let (hits, took) = query_rows(&state, &sql).await?;
     match hits.first() {
         Some(doc) => {
             let abi: Value = doc["abi"]
@@ -258,24 +249,15 @@ pub async fn get_created_accounts(
     State(state): State<Shared>,
     Query(params): Query<AccountParam>,
 ) -> ApiResult {
-    let body = json!({
-        "size": 100,
-        "query": {"bool": {"filter": [
-            {"term": {"act.name": "newaccount"}},
-            {"term": {"@newaccount.creator": params.account}},
-        ]}},
-        "sort": [{"global_sequence": {"order": "desc"}}],
-    });
-    let (hits, _, took) = search_sources(&state, "action", body).await?;
+    let sql = crate::clickhouse::build_get_created_accounts_query(&params.account)
+        .map_err(ApiError::internal)?;
+    let (hits, took) = query_rows(&state, &sql).await?;
     let accounts: Vec<Value> = hits
         .iter()
         .map(|a| {
-            let name = a["act"]["data"]["newact"]
-                .as_str()
-                .or_else(|| a["act"]["data"]["name"].as_str());
             json!({
-                "name": name,
-                "timestamp": a["@timestamp"],
+                "name": a["newaccount_newact"],
+                "timestamp": a["timestamp"],
                 "trx_id": a["trx_id"],
             })
         })
@@ -287,23 +269,15 @@ pub async fn get_creator(
     State(state): State<Shared>,
     Query(params): Query<AccountParam>,
 ) -> ApiResult {
-    let body = json!({
-        "size": 1,
-        "query": {"bool": {
-            "filter": [
-                {"term": {"act.name": "newaccount"}},
-                {"term": {"@newaccount.newact": params.account}},
-            ],
-        }},
-        "sort": [{"global_sequence": {"order": "asc"}}],
-    });
-    let (hits, _, took) = search_sources(&state, "action", body).await?;
+    let sql =
+        crate::clickhouse::build_get_creator_query(&params.account).map_err(ApiError::internal)?;
+    let (hits, took) = query_rows(&state, &sql).await?;
     match hits.first() {
         Some(a) => Ok(Json(json!({
             "query_time_ms": took,
             "account": params.account,
-            "creator": a["act"]["data"]["creator"],
-            "timestamp": a["@timestamp"],
+            "creator": a["newaccount_creator"],
+            "timestamp": a["timestamp"],
             "block_num": a["block_num"],
             "trx_id": a["trx_id"],
         }))),
