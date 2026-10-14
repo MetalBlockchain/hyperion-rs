@@ -200,3 +200,73 @@ pub async fn search_sources(
     let total = res["hits"]["total"].clone();
     Ok((hits, total, took))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::extract::Query;
+
+    #[tokio::test]
+    async fn v1_and_v2_look_up_ml_dsa_public_keys() {
+        let keys: Vec<_> = [
+            ("MLDSA44", 1312, "4pxTJf"),
+            ("MLDSA65", 1952, "QM2i8"),
+            ("MLDSA87", 2592, "6xdVrX"),
+        ]
+        .into_iter()
+        .map(|(suffix, len, tail)| format!("PUB_{suffix}_{}{tail}", "1".repeat(len)))
+        .collect();
+        let permission = json!({"owner": "alice", "name": "active", "keys": keys});
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route(
+                "/test-perm/_search",
+                post(
+                    |State(permission): State<Value>, Json(query): Json<Value>| async move {
+                        let key = &query["query"]["bool"]["filter"][0]["term"]["keys"];
+                        let hits = if permission["keys"].as_array().unwrap().contains(key) {
+                            vec![json!({"_source": permission})]
+                        } else {
+                            Vec::new()
+                        };
+                        Json(json!({"hits": {"total": {"value": hits.len()}, "hits": hits}}))
+                    },
+                ),
+            )
+            .with_state(permission.clone());
+        let mut servers = tokio::task::JoinSet::new();
+        servers.spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let config: Config = toml::from_str(&format!(
+            "[chain]\nname = 'test'\nhttp = 'http://{addr}'\nship = 'ws://{addr}'\n[elasticsearch]\nurl = 'http://{addr}'"
+        ))
+        .unwrap();
+        let shared = Arc::new(ApiState {
+            es: Elastic::new(&config.elasticsearch),
+            chain: config.chain.client(),
+            config,
+            lib_cache: Mutex::new(None),
+        });
+        for key in keys {
+            let Json(v1) = v1::get_key_accounts(
+                State(shared.clone()),
+                Json(v1::V1GetKeyAccounts {
+                    public_key: format!(" {key} "),
+                }),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("v1 lookup failed: {}", e.1));
+            assert_eq!(v1, json!({"account_names": ["alice"]}));
+            let Json(v2) = state::get_key_accounts(
+                State(shared.clone()),
+                Query(state::KeyParams {
+                    public_key: format!(" {key} "),
+                }),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("v2 lookup failed: {}", e.1));
+            assert_eq!(v2["account_names"], json!(["alice"]));
+            assert_eq!(v2["permissions"], json!([permission]));
+        }
+    }
+}

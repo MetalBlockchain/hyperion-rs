@@ -91,7 +91,14 @@ fn action_trace(buf: &mut Vec<u8>, ordinal: u32, receiver: &str, global_sequence
     push_bytes(buf, &[]); // return_value
 }
 
-fn traces_payload() -> Vec<u8> {
+// Synthetic zero payloads exercise wire decoding without signature verification.
+const ML_DSA_VARIANTS: [(u8, usize, usize, &str, &str); 3] = [
+    (3, 1312, 2420, "4pxTJf", "6nQj2T"),
+    (4, 1952, 3309, "QM2i8", "4ogVNU"),
+    (5, 2592, 4627, "6xdVrX", "2CHpCH"),
+];
+
+fn traces_payload(ml_dsa: bool) -> Vec<u8> {
     let mut buf = Vec::new();
     push_varuint32(&mut buf, 1); // one transaction trace
     push_varuint32(&mut buf, 0); // transaction_trace_v0
@@ -119,14 +126,20 @@ fn traces_payload() -> Vec<u8> {
     buf.push(0);
     push_varuint32(&mut buf, 0);
     push_varuint32(&mut buf, 0); // transaction_extensions
-    push_varuint32(&mut buf, 1); // one signature
+    push_varuint32(&mut buf, if ml_dsa { 4 } else { 1 });
     buf.push(0);
     buf.extend_from_slice(&[0x11; 65]);
+    if ml_dsa {
+        for (tag, key_len, sig_len, _, _) in ML_DSA_VARIANTS {
+            buf.push(tag);
+            buf.resize(buf.len() + key_len + sig_len, 0);
+        }
+    }
     push_varuint32(&mut buf, 0); // context_free_data
     buf
 }
 
-fn deltas_payload() -> Vec<u8> {
+fn deltas_payload(ml_dsa: bool) -> Vec<u8> {
     let mut buf = Vec::new();
     push_varuint32(&mut buf, 2); // two table deltas
 
@@ -148,7 +161,7 @@ fn deltas_payload() -> Vec<u8> {
     push_bytes(&mut row, &balance);
     push_bytes(&mut buf, &row);
 
-    // permission: bob@active with one key
+    // permission: bob@active with K1 and optional ML-DSA keys
     push_varuint32(&mut buf, 0); // table_delta_v0
     push_bytes(&mut buf, b"permission");
     push_varuint32(&mut buf, 1);
@@ -160,10 +173,17 @@ fn deltas_payload() -> Vec<u8> {
     push_name(&mut row, "owner"); // parent
     row.extend_from_slice(&1_600_000_000_000_000i64.to_le_bytes()); // last_updated
     row.extend_from_slice(&1u32.to_le_bytes()); // threshold
-    push_varuint32(&mut row, 1); // one key
+    push_varuint32(&mut row, if ml_dsa { 4 } else { 1 });
     row.push(0); // K1
     row.extend_from_slice(&[0u8; 33]); // the all-zeros key
     row.extend_from_slice(&1u16.to_le_bytes()); // weight
+    if ml_dsa {
+        for (tag, key_len, _, _, _) in ML_DSA_VARIANTS {
+            row.push(tag);
+            row.resize(row.len() + key_len, 0);
+            row.extend_from_slice(&1u16.to_le_bytes());
+        }
+    }
     push_varuint32(&mut row, 0); // accounts
     push_varuint32(&mut row, 0); // waits
     push_bytes(&mut buf, &row);
@@ -207,10 +227,10 @@ fn status_result() -> Vec<u8> {
 }
 
 fn blocks_result() -> Vec<u8> {
-    blocks_result_at(42, 1)
+    blocks_result_at(42, 1, false)
 }
 
-fn blocks_result_at(block_num: u32, transactions: u32) -> Vec<u8> {
+fn blocks_result_at(block_num: u32, transactions: u32, ml_dsa: bool) -> Vec<u8> {
     let mut buf = Vec::new();
     push_varuint32(&mut buf, 1); // get_blocks_result_v0
     push_block_position(&mut buf, 100, 0x0a); // head
@@ -223,7 +243,7 @@ fn blocks_result_at(block_num: u32, transactions: u32) -> Vec<u8> {
     buf.push(1);
     push_bytes(&mut buf, &block_payload());
     buf.push(1);
-    let trace = traces_payload();
+    let trace = traces_payload(ml_dsa);
     let mut traces = Vec::new();
     push_varuint32(&mut traces, transactions);
     for _ in 0..transactions {
@@ -231,7 +251,7 @@ fn blocks_result_at(block_num: u32, transactions: u32) -> Vec<u8> {
     }
     push_bytes(&mut buf, &traces);
     buf.push(1);
-    push_bytes(&mut buf, &deltas_payload());
+    push_bytes(&mut buf, &deltas_payload(ml_dsa));
     buf
 }
 
@@ -327,7 +347,7 @@ async fn mock_es_handler(
     }
 }
 
-async fn run_mock_ship(listener: tokio::net::TcpListener, transactions: u32) {
+async fn run_mock_ship(listener: tokio::net::TcpListener, transactions: u32, ml_dsa: bool) {
     let (stream, _) = listener.accept().await.expect("ship accept");
     let mut ws = tokio_tungstenite::accept_async(stream)
         .await
@@ -361,10 +381,10 @@ async fn run_mock_ship(listener: tokio::net::TcpListener, transactions: u32) {
             _ => 0,
         };
         for _ in 0..credit.min(end_block - next_block) {
-            let payload = if next_block == 42 && transactions == 1 {
+            let payload = if next_block == 42 && transactions == 1 && !ml_dsa {
                 blocks_result()
             } else {
-                blocks_result_at(next_block, transactions)
+                blocks_result_at(next_block, transactions, ml_dsa)
             };
             if ws.send(Message::Binary(payload.into())).await.is_err() {
                 return;
@@ -393,6 +413,7 @@ struct PipelineOptions {
     fail_bulk: bool,
     decode_workers: usize,
     writer_concurrency: usize,
+    ml_dsa: bool,
 }
 
 impl Default for PipelineOptions {
@@ -406,6 +427,7 @@ impl Default for PipelineOptions {
             fail_bulk: false,
             decode_workers: 2,
             writer_concurrency: 4,
+            ml_dsa: false,
         }
     }
 }
@@ -436,7 +458,11 @@ async fn run_pipeline_options(
 
     let ship_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let ship_addr = ship_listener.local_addr().unwrap();
-    servers.spawn(run_mock_ship(ship_listener, options.transactions));
+    servers.spawn(run_mock_ship(
+        ship_listener,
+        options.transactions,
+        options.ml_dsa,
+    ));
 
     let stop_block = 41 + options.blocks;
     let batch_size = options.batch_size;
@@ -618,6 +644,46 @@ async fn indexes_with_pulsevm_chain_api() {
         .map(|(_, d)| d)
         .unwrap();
     assert_eq!(delta["data"]["balance"], "12.3456 EOS");
+}
+
+#[tokio::test]
+async fn indexes_mixed_ml_dsa_permissions_and_signatures() {
+    let docs = run_pipeline_options(
+        "pulsevm",
+        PipelineOptions {
+            ml_dsa: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let action = docs.iter().find(|(i, _)| i == "test-action").unwrap();
+    let perm = docs.iter().find(|(i, _)| i == "test-perm").unwrap();
+    assert_eq!(action.1["act"]["data"]["quantity"], "1.0000 EOS");
+    assert_eq!(action.1["signatures"].as_array().unwrap().len(), 4);
+    assert_eq!(perm.1["keys"].as_array().unwrap().len(), 4);
+    assert_eq!(perm.1["owner"], "bob");
+    assert_eq!(
+        perm.1["keys"][0],
+        "PUB_K1_11111111111111111111111111111111149Mr2R"
+    );
+    for (index, (tag, key_len, sig_len, key_tail, sig_tail)) in ML_DSA_VARIANTS.iter().enumerate() {
+        let suffix = match tag {
+            3 => "MLDSA44",
+            4 => "MLDSA65",
+            5 => "MLDSA87",
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            perm.1["keys"][index + 1],
+            format!("PUB_{suffix}_{}{key_tail}", "1".repeat(*key_len))
+        );
+        assert_eq!(
+            action.1["signatures"][index + 1],
+            format!("SIG_{suffix}_{}{sig_tail}", "1".repeat(key_len + sig_len))
+        );
+    }
+    assert!(docs.iter().any(|(i, _)| i == "test-block"));
 }
 
 #[tokio::test]

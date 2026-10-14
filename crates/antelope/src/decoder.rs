@@ -350,4 +350,144 @@ mod tests {
         let decoder = AbiDecoder::new(&abi);
         assert!(decoder.decode("nonexistent", &[]).is_err());
     }
+
+    #[test]
+    fn decodes_newaccount_and_updateauth_with_mixed_ml_dsa_authorities() {
+        let abi: Abi = serde_json::from_value(json!({
+            "version": "eosio::abi/1.1",
+            "structs": [
+                {"name": "key_weight", "base": "", "fields": [
+                    {"name": "key", "type": "public_key"},
+                    {"name": "weight", "type": "uint16"}
+                ]},
+                {"name": "permission_level", "base": "", "fields": [
+                    {"name": "actor", "type": "name"},
+                    {"name": "permission", "type": "name"}
+                ]},
+                {"name": "permission_level_weight", "base": "", "fields": [
+                    {"name": "permission", "type": "permission_level"},
+                    {"name": "weight", "type": "uint16"}
+                ]},
+                {"name": "wait_weight", "base": "", "fields": [
+                    {"name": "wait_sec", "type": "uint32"},
+                    {"name": "weight", "type": "uint16"}
+                ]},
+                {"name": "authority", "base": "", "fields": [
+                    {"name": "threshold", "type": "uint32"},
+                    {"name": "keys", "type": "key_weight[]"},
+                    {"name": "accounts", "type": "permission_level_weight[]"},
+                    {"name": "waits", "type": "wait_weight[]"}
+                ]},
+                {"name": "newaccount", "base": "", "fields": [
+                    {"name": "creator", "type": "name"},
+                    {"name": "name", "type": "name"},
+                    {"name": "owner", "type": "authority"},
+                    {"name": "active", "type": "authority"}
+                ]},
+                {"name": "updateauth", "base": "", "fields": [
+                    {"name": "account", "type": "name"},
+                    {"name": "permission", "type": "name"},
+                    {"name": "parent", "type": "name"},
+                    {"name": "auth", "type": "authority"}
+                ]}
+            ],
+            "actions": [
+                {"name": "newaccount", "type": "newaccount", "ricardian_contract": ""},
+                {"name": "updateauth", "type": "updateauth", "ricardian_contract": ""}
+            ]
+        }))
+        .unwrap();
+        let decoder = AbiDecoder::new(&abi);
+        for (tag, suffix, key_len, tail) in [
+            (3, "MLDSA44", 1312, "4pxTJf"),
+            (4, "MLDSA65", 1952, "QM2i8"),
+            (5, "MLDSA87", 2592, "6xdVrX"),
+        ] {
+            let key = format!("PUB_{suffix}_{}{tail}", "1".repeat(key_len));
+            let mut authority = 2u32.to_le_bytes().to_vec();
+            authority.push(2); // two key weights
+            authority.push(0); // K1
+            authority.extend_from_slice(&[0; 33]);
+            authority.extend_from_slice(&1u16.to_le_bytes());
+            authority.push(tag);
+            authority.resize(authority.len() + key_len, 0);
+            authority.extend_from_slice(&2u16.to_le_bytes());
+            authority.push(1); // one controlling account
+            authority.extend_from_slice(&"bob".parse::<Name>().unwrap().0.to_le_bytes());
+            authority.extend_from_slice(&"active".parse::<Name>().unwrap().0.to_le_bytes());
+            authority.extend_from_slice(&3u16.to_le_bytes());
+            authority.push(1); // one wait weight
+            authority.extend_from_slice(&60u32.to_le_bytes());
+            authority.extend_from_slice(&1u16.to_le_bytes());
+            let expected = json!({
+                "threshold": 2,
+                "keys": [
+                    {"key": "PUB_K1_11111111111111111111111111111111149Mr2R", "weight": 1},
+                    {"key": key, "weight": 2}
+                ],
+                "accounts": [{"permission": {"actor": "bob", "permission": "active"}, "weight": 3}],
+                "waits": [{"wait_sec": 60, "weight": 1}]
+            });
+
+            let mut data = "pulse".parse::<Name>().unwrap().0.to_le_bytes().to_vec();
+            data.extend_from_slice(&"alice".parse::<Name>().unwrap().0.to_le_bytes());
+            data.extend_from_slice(&authority);
+            data.extend_from_slice(&authority);
+            assert_eq!(
+                decoder
+                    .decode_action("newaccount".parse().unwrap(), &data)
+                    .unwrap(),
+                json!({"creator": "pulse", "name": "alice", "owner": expected, "active": expected})
+            );
+
+            let mut data = "alice".parse::<Name>().unwrap().0.to_le_bytes().to_vec();
+            data.extend_from_slice(&"active".parse::<Name>().unwrap().0.to_le_bytes());
+            data.extend_from_slice(&"owner".parse::<Name>().unwrap().0.to_le_bytes());
+            data.extend_from_slice(&authority);
+            assert_eq!(
+                decoder
+                    .decode_action("updateauth".parse().unwrap(), &data)
+                    .unwrap(),
+                json!({"account": "alice", "permission": "active", "parent": "owner", "auth": expected})
+            );
+            assert!(decoder
+                .decode_action("updateauth".parse().unwrap(), &data[..data.len() - 4])
+                .is_err());
+        }
+    }
+
+    #[test]
+    fn decodes_ml_dsa_abi_keys_and_signature_envelopes() {
+        let abi: Abi = serde_json::from_value(json!({
+            "structs": [{"name": "signed_value", "fields": [
+                {"name": "key", "type": "public_key"},
+                {"name": "signature", "type": "signature"},
+                {"name": "sequence", "type": "uint32"}
+            ]}]
+        }))
+        .unwrap();
+        let decoder = AbiDecoder::new(&abi);
+        for (tag, suffix, key_len, sig_len, key_tail, sig_tail) in [
+            (3, "MLDSA44", 1312, 3732, "4pxTJf", "6nQj2T"),
+            (4, "MLDSA65", 1952, 5261, "QM2i8", "4ogVNU"),
+            (5, "MLDSA87", 2592, 7219, "6xdVrX", "2CHpCH"),
+        ] {
+            let mut data = vec![tag];
+            data.resize(1 + key_len, 0);
+            data.push(tag);
+            data.resize(data.len() + sig_len, 0);
+            data.extend_from_slice(&42u32.to_le_bytes());
+            assert_eq!(
+                decoder.decode("signed_value", &data).unwrap(),
+                json!({
+                    "key": format!("PUB_{suffix}_{}{key_tail}", "1".repeat(key_len)),
+                    "signature": format!("SIG_{suffix}_{}{sig_tail}", "1".repeat(sig_len)),
+                    "sequence": 42
+                })
+            );
+            assert!(decoder
+                .decode("signed_value", &data[..data.len() - 5])
+                .is_err());
+        }
+    }
 }

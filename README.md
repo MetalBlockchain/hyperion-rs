@@ -45,6 +45,17 @@ layer).
   (`api = "pulsevm"`, methods `pulsevm.getInfo` / `pulsevm.getABI`, URL like
   `http://node:9650/ext/bc/<chainID>/rpc`). Set `system_account` to the
   chain's privileged account (`eosio` on Antelope, `pulse` on PulseVM).
+- **Keys and signatures** — ABI and SHIP decoding support K1, R1, WebAuthn,
+  and PulseVM's ML-DSA-44/65/87 extensions from
+  [PulseVM PR #116](https://github.com/MetalBlockchain/pulsevm/pull/116).
+  ML-DSA tags 3/4/5 carry fixed-size public keys (1,312/1,952/2,592 bytes);
+  signature envelopes carry that key followed by the detached signature
+  (2,420/3,309/4,627 bytes), without length prefixes. Indexed JSON uses
+  `PUB_MLDSA44_...` / `SIG_MLDSA44_...` (and `MLDSA65` / `MLDSA87`) with
+  the same base58 and RIPEMD-160 checksum convention as PulseVM. This covers
+  `newaccount`/`updateauth` authority data, permission deltas, and transaction
+  signatures. The indexer decodes these values; PulseVM validates signatures
+  and enforces protocol activation.
 - **Document model** — one doc per unique action (notification traces from
   `require_recipient` are collapsed into `notified` + `receipts`, keyed by
   `act_digest`), matching Hyperion's query semantics. Deterministic document
@@ -161,7 +172,7 @@ v2 (Hyperion-style, GET):
 - `/v2/history/get_abi_snapshot?contract=&block=`
 - `/v2/history/get_created_accounts?account=`
 - `/v2/history/get_creator?account=`
-- `/v2/state/get_key_accounts?public_key=` (accepts `PUB_K1_...` or legacy `EOS...`)
+- `/v2/state/get_key_accounts?public_key=` (accepts `PUB_K1_...`, `PUB_R1_...`, `PUB_WA_...`, `PUB_MLDSA44_...` / `PUB_MLDSA65_...` / `PUB_MLDSA87_...`, or legacy `EOS...`)
 - `/v2/state/get_tokens?account=`
 - `/v2/state/get_account?account=`
 
@@ -171,6 +182,8 @@ v1 compatibility (nodeos history plugin, POST):
 - `/v1/history/get_transaction`
 - `/v1/history/get_key_accounts`
 - `/v1/history/get_controlled_accounts`
+
+Both key-account lookup endpoints accept the same public key formats.
 
 ## Not implemented (yet)
 

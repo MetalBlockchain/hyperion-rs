@@ -953,6 +953,128 @@ mod tests {
         assert!(partial.signatures[0].starts_with("SIG_K1_"));
     }
 
+    fn mixed_signatures(buf: &mut Vec<u8>) -> Vec<String> {
+        push_varuint32(buf, 4);
+        let mut expected = Vec::new();
+        for (tag, suffix, len, tail) in [
+            (0, "K1", 65, "6uk5ne"),
+            (3, "MLDSA44", 3732, "6nQj2T"),
+            (4, "MLDSA65", 5261, "4ogVNU"),
+            (5, "MLDSA87", 7219, "2CHpCH"),
+        ] {
+            buf.push(tag);
+            buf.resize(buf.len() + len, 0);
+            expected.push(format!("SIG_{suffix}_{}{tail}", "1".repeat(len)));
+        }
+        expected
+    }
+
+    #[test]
+    fn decodes_ml_dsa_signatures_in_all_partial_transaction_forms() {
+        // v0 stores signatures directly; v1 stores them in prunable data.
+        for (version, prunable) in [(0, None), (1, Some(0)), (1, Some(2)), (1, Some(3))] {
+            let mut buf = Vec::new();
+            push_varuint32(&mut buf, version);
+            buf.extend_from_slice(&1700000000u32.to_le_bytes());
+            buf.extend_from_slice(&12u16.to_le_bytes());
+            buf.extend_from_slice(&34u32.to_le_bytes());
+            buf.extend_from_slice(&[0, 0, 0, 0]); // net, cpu, delay, extensions
+            if let Some(index) = prunable {
+                buf.push(1); // prunable data present
+                push_varuint32(&mut buf, index);
+            }
+            let expected = mixed_signatures(&mut buf);
+            if prunable == Some(0) {
+                push_bytes(&mut buf, &[7, 8]); // packed_context_free_data
+            } else {
+                push_varuint32(&mut buf, 1); // context-free segment/data count
+                if prunable == Some(2) {
+                    push_varuint32(&mut buf, 1); // segment_type: bytes
+                }
+                push_bytes(&mut buf, &[7, 8]);
+            }
+            buf.push(42);
+            let mut reader = ByteReader::new(&buf);
+            let partial = PartialTransaction::read(&mut reader).unwrap();
+            assert_eq!(partial.signatures, expected);
+            assert_eq!(partial.ref_block_num, 12);
+            assert_eq!(reader.read_u8().unwrap(), 42);
+            assert!(reader.is_empty());
+        }
+    }
+
+    #[test]
+    fn decodes_permission_with_mixed_ml_dsa_keys() {
+        let mut row = vec![0]; // permission_v0
+        push_name(&mut row, "alice");
+        push_name(&mut row, "active");
+        push_name(&mut row, "owner");
+        row.extend_from_slice(&1_600_000_000_000_000i64.to_le_bytes());
+        row.extend_from_slice(&2u32.to_le_bytes());
+        push_varuint32(&mut row, 4);
+        let mut expected = Vec::new();
+        for (tag, suffix, len, tail) in [
+            (0, "K1", 33, "49Mr2R"),
+            (3, "MLDSA44", 1312, "4pxTJf"),
+            (4, "MLDSA65", 1952, "QM2i8"),
+            (5, "MLDSA87", 2592, "6xdVrX"),
+        ] {
+            row.push(tag);
+            row.resize(row.len() + len, 0);
+            row.extend_from_slice(&1u16.to_le_bytes());
+            expected.push(format!("PUB_{suffix}_{}{tail}", "1".repeat(len)));
+        }
+        push_varuint32(&mut row, 1); // accounts
+        push_name(&mut row, "bob");
+        push_name(&mut row, "active");
+        row.extend_from_slice(&2u16.to_le_bytes());
+        push_varuint32(&mut row, 1); // waits
+        row.extend_from_slice(&60u32.to_le_bytes());
+        row.extend_from_slice(&1u16.to_le_bytes());
+
+        let perm = PermissionRow::decode(&row).unwrap();
+        assert_eq!(perm.owner.to_string(), "alice");
+        assert_eq!(perm.name.to_string(), "active");
+        assert_eq!(perm.parent.to_string(), "owner");
+        assert_eq!(perm.threshold, 2);
+        assert_eq!(perm.keys, expected);
+        assert_eq!(perm.accounts, ["bob@active"]);
+        assert!(PermissionRow::decode(&row[..row.len() - 1]).is_err());
+    }
+
+    #[test]
+    fn decodes_block_receipts_with_ml_dsa_transaction_signatures() {
+        let mut block = 1000u32.to_le_bytes().to_vec();
+        push_name(&mut block, "producer1");
+        block.extend_from_slice(&0u16.to_le_bytes());
+        block.extend_from_slice(&[0; 96]); // previous and merkle roots
+        block.extend_from_slice(&7u32.to_le_bytes());
+        block.extend_from_slice(&[0, 0]); // no schedule or extensions
+        block.push(0); // producer signature remains K1
+        block.extend_from_slice(&[0; 65]);
+        push_varuint32(&mut block, 2); // two transaction receipts
+        for cpu in [150u32, 250] {
+            block.push(0); // executed
+            block.extend_from_slice(&cpu.to_le_bytes());
+            push_varuint32(&mut block, 12);
+            push_varuint32(&mut block, 1); // packed_transaction
+            mixed_signatures(&mut block);
+            block.push(0); // no compression
+            push_bytes(&mut block, &[]);
+            push_bytes(&mut block, &[7, 8]);
+        }
+        let header = BlockHeader::decode(&block).unwrap();
+        assert_eq!(header.producer.to_string(), "producer1");
+        assert_eq!(header.trx_count, 2);
+        assert_eq!(header.cpu_usage_us, 400);
+        assert_eq!(header.net_usage_words, 24);
+        assert_eq!(
+            header.producer_signature,
+            format!("SIG_K1_{}6uk5ne", "1".repeat(65))
+        );
+        assert!(BlockHeader::decode(&block[..block.len() - 1]).is_err());
+    }
+
     #[test]
     fn decodes_table_deltas() {
         let mut buf = Vec::new();
